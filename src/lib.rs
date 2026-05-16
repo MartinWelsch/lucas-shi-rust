@@ -13,6 +13,6 @@ mod pyramid;
 mod utils;
 
 // Re-export main functionality
-pub use features::good_features_to_track;
+pub use features::{good_features_to_track, good_features_to_track_in_rect, Rect};
 pub use lk::calc_optical_flow;
 pub use pyramid::build_pyramid;
