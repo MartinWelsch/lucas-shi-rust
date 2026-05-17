@@ -45,7 +45,7 @@ pub fn calc_optical_flow(
         // let grad_x = horizontal_scharr(prev_img);
         // let grad_y = vertical_scharr(prev_img);
         // console_log!("{}", performance.now()-now);
-        let (grad_x, grad_y) = compute_gradients(prev_img);
+        let (grad_x, grad_y) = compute_gradients(&prev_img.as_flat_samples());
 
         let mut prev_patch = vec![0.0f32; n_pixels];
         let mut ix_patch = vec![0.0f32; n_pixels];

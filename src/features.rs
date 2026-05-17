@@ -19,7 +19,7 @@ pub fn good_features_to_track(
     min_distance: u32,
 ) -> Vec<(u32, u32, f32)> {
     // Compute gradients
-    let (gx, gy) = compute_gradients(image);
+    let (gx, gy) = compute_gradients(&image.as_flat_samples());
 
     // Compute squared gradients and their product
     let (mut ix_sq, mut iy_sq, mut ix_iy) = compute_gradient_products(&gx, &gy);

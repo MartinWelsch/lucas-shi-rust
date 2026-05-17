@@ -1,4 +1,4 @@
-use image::{GrayImage, ImageBuffer, Luma};
+use image::{flat::FlatSamples, GrayImage, ImageBuffer, Luma};
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 #[cfg(target_arch = "x86")]
@@ -21,24 +21,24 @@ type GradientProduct = (
 /// - `x86`/`x86_64`: runtime AVX2 detection, otherwise scalar fallback
 /// - everything else: historical scalar implementation
 #[cfg(target_arch = "aarch64")]
-pub fn compute_gradients(img: &GrayImage) -> GradientProduct {
-    unsafe { compute_gradients_neon(img) }
+pub fn compute_gradients(image: &FlatSamples<&[u8]>) -> GradientProduct {
+    unsafe { compute_gradients_neon(image) }
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-pub fn compute_gradients(img: &GrayImage) -> GradientProduct {
+pub fn compute_gradients(image: &FlatSamples<&[u8]>) -> GradientProduct {
     if is_x86_feature_detected!("avx2") {
         unsafe {
-            return compute_gradients_avx2(img);
+            return compute_gradients_avx2(image);
         }
     }
 
-    compute_gradients_manual(img, &HORIZONTAL_SCHARR_3X3_OLD, &VERTICAL_SCHARR_3X3_OLD)
+    compute_gradients_manual(image, &HORIZONTAL_SCHARR_3X3_OLD, &VERTICAL_SCHARR_3X3_OLD)
 }
 
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")))]
-pub fn compute_gradients(img: &GrayImage) -> GradientProduct {
-    compute_gradients_manual(img, &HORIZONTAL_SCHARR_3X3_OLD, &VERTICAL_SCHARR_3X3_OLD)
+pub fn compute_gradients(image: &FlatSamples<&[u8]>) -> GradientProduct {
+    compute_gradients_manual(image, &HORIZONTAL_SCHARR_3X3_OLD, &VERTICAL_SCHARR_3X3_OLD)
 }
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
@@ -50,11 +50,15 @@ fn zero_gradients(width: u32, height: u32) -> GradientProduct {
 }
 
 fn compute_gradients_manual(
-    img: &GrayImage,
+    image: &FlatSamples<&[u8]>,
     kernel_x: &[i32; 9],
     kernel_y: &[i32; 9],
 ) -> GradientProduct {
-    let (width, height) = img.dimensions();
+    let width = image.layout.width;
+    let height = image.layout.height;
+    let row_stride = image.layout.height_stride;
+    let src = image.samples;
+
     let mut grad_x = ImageBuffer::new(width, height);
     let mut grad_y = ImageBuffer::new(width, height);
 
@@ -67,9 +71,11 @@ fn compute_gradients_manual(
             let mut gx: i32 = 0;
             let mut gy: i32 = 0;
 
-            for ky in 0..3 {
-                for kx in 0..3 {
-                    let pixel = img.get_pixel(x + kx - 1, y + ky - 1)[0] as i32;
+            for ky in 0..3u32 {
+                for kx in 0..3u32 {
+                    let sx = (x + kx - 1) as usize;
+                    let sy = (y + ky - 1) as usize;
+                    let pixel = src[sy * row_stride + sx] as i32;
                     gx += pixel * kernel_x[(ky * 3 + kx) as usize];
                     gy += pixel * kernel_y[(ky * 3 + kx) as usize];
                 }
@@ -85,16 +91,18 @@ fn compute_gradients_manual(
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn compute_gradients_avx2(img: &GrayImage) -> GradientProduct {
-    let (width_u32, height_u32) = img.dimensions();
+unsafe fn compute_gradients_avx2(image: &FlatSamples<&[u8]>) -> GradientProduct {
+    let width_u32 = image.layout.width;
+    let height_u32 = image.layout.height;
     let width = width_u32 as usize;
     let height = height_u32 as usize;
+    let row_stride = image.layout.height_stride;
 
     if width < 3 || height < 3 {
         return zero_gradients(width_u32, height_u32);
     }
 
-    let src = img.as_raw();
+    let src = image.samples;
     let mut grad_x = vec![0i16; width * height];
     let mut grad_y = vec![0i16; width * height];
 
@@ -105,9 +113,9 @@ unsafe fn compute_gradients_avx2(img: &GrayImage) -> GradientProduct {
     for y in 1..height - 1 {
         let (top, mid, bottom) = unsafe {
             (
-                src.as_ptr().add((y - 1) * width),
-                src.as_ptr().add(y * width),
-                src.as_ptr().add((y + 1) * width),
+                src.as_ptr().add((y - 1) * row_stride),
+                src.as_ptr().add(y * row_stride),
+                src.as_ptr().add((y + 1) * row_stride),
             )
         };
         let row = y * width;
@@ -151,13 +159,13 @@ unsafe fn compute_gradients_avx2(img: &GrayImage) -> GradientProduct {
         while x < width - 1 {
             let idx = row + x;
             let gx = 3
-                * ((src[(y - 1) * width + x + 1] as i32 + src[(y + 1) * width + x + 1] as i32)
-                    - (src[(y - 1) * width + x - 1] as i32 + src[(y + 1) * width + x - 1] as i32))
-                + 10 * (src[y * width + x + 1] as i32 - src[y * width + x - 1] as i32);
+                * ((src[(y - 1) * row_stride + x + 1] as i32 + src[(y + 1) * row_stride + x + 1] as i32)
+                    - (src[(y - 1) * row_stride + x - 1] as i32 + src[(y + 1) * row_stride + x - 1] as i32))
+                + 10 * (src[y * row_stride + x + 1] as i32 - src[y * row_stride + x - 1] as i32);
             let gy = 3
-                * ((src[(y + 1) * width + x - 1] as i32 + src[(y + 1) * width + x + 1] as i32)
-                    - (src[(y - 1) * width + x - 1] as i32 + src[(y - 1) * width + x + 1] as i32))
-                + 10 * (src[(y + 1) * width + x] as i32 - src[(y - 1) * width + x] as i32);
+                * ((src[(y + 1) * row_stride + x - 1] as i32 + src[(y + 1) * row_stride + x + 1] as i32)
+                    - (src[(y - 1) * row_stride + x - 1] as i32 + src[(y - 1) * row_stride + x + 1] as i32))
+                + 10 * (src[(y + 1) * row_stride + x] as i32 - src[(y - 1) * row_stride + x] as i32);
 
             grad_x[idx] = gx as i16;
             grad_y[idx] = gy as i16;
@@ -179,16 +187,18 @@ unsafe fn load_u8x16_as_i16(ptr: *const u8) -> __m256i {
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn compute_gradients_neon(img: &GrayImage) -> GradientProduct {
-    let (width_u32, height_u32) = img.dimensions();
+unsafe fn compute_gradients_neon(image: &FlatSamples<&[u8]>) -> GradientProduct {
+    let width_u32 = image.layout.width;
+    let height_u32 = image.layout.height;
     let width = width_u32 as usize;
     let height = height_u32 as usize;
+    let row_stride = image.layout.height_stride;
 
     if width < 3 || height < 3 {
         return zero_gradients(width_u32, height_u32);
     }
 
-    let src = img.as_raw();
+    let src = image.samples;
     let mut grad_x = vec![0i16; width * height];
     let mut grad_y = vec![0i16; width * height];
 
@@ -199,9 +209,9 @@ unsafe fn compute_gradients_neon(img: &GrayImage) -> GradientProduct {
     for y in 1..height - 1 {
         let (top, mid, bottom) = unsafe {
             (
-                src.as_ptr().add((y - 1) * width),
-                src.as_ptr().add(y * width),
-                src.as_ptr().add((y + 1) * width),
+                src.as_ptr().add((y - 1) * row_stride),
+                src.as_ptr().add(y * row_stride),
+                src.as_ptr().add((y + 1) * row_stride),
             )
         };
         let row = y * width;
@@ -262,13 +272,13 @@ unsafe fn compute_gradients_neon(img: &GrayImage) -> GradientProduct {
         while x < width - 1 {
             let idx = row + x;
             let gx = 3
-                * ((src[(y - 1) * width + x + 1] as i32 + src[(y + 1) * width + x + 1] as i32)
-                    - (src[(y - 1) * width + x - 1] as i32 + src[(y + 1) * width + x - 1] as i32))
-                + 10 * (src[y * width + x + 1] as i32 - src[y * width + x - 1] as i32);
+                * ((src[(y - 1) * row_stride + x + 1] as i32 + src[(y + 1) * row_stride + x + 1] as i32)
+                    - (src[(y - 1) * row_stride + x - 1] as i32 + src[(y + 1) * row_stride + x - 1] as i32))
+                + 10 * (src[y * row_stride + x + 1] as i32 - src[y * row_stride + x - 1] as i32);
             let gy = 3
-                * ((src[(y + 1) * width + x - 1] as i32 + src[(y + 1) * width + x + 1] as i32)
-                    - (src[(y - 1) * width + x - 1] as i32 + src[(y - 1) * width + x + 1] as i32))
-                + 10 * (src[(y + 1) * width + x] as i32 - src[(y - 1) * width + x] as i32);
+                * ((src[(y + 1) * row_stride + x - 1] as i32 + src[(y + 1) * row_stride + x + 1] as i32)
+                    - (src[(y - 1) * row_stride + x - 1] as i32 + src[(y - 1) * row_stride + x + 1] as i32))
+                + 10 * (src[(y + 1) * row_stride + x] as i32 - src[(y - 1) * row_stride + x] as i32);
 
             grad_x[idx] = gx as i16;
             grad_y[idx] = gy as i16;
@@ -312,9 +322,11 @@ mod tests {
     #[test]
     fn selected_gradients_match_manual_reference() {
         let img = make_test_image(128, 96);
-        let expected =
-            compute_gradients_manual(&img, &HORIZONTAL_SCHARR_3X3_OLD, &VERTICAL_SCHARR_3X3_OLD);
-        let actual = compute_gradients(&img);
+        let fs = img.as_flat_samples();
+        let expected = compute_gradients_manual(
+            &fs, &HORIZONTAL_SCHARR_3X3_OLD, &VERTICAL_SCHARR_3X3_OLD,
+        );
+        let actual = compute_gradients(&fs);
 
         assert_eq!(expected.0, actual.0, "horizontal gradients differ");
         assert_eq!(expected.1, actual.1, "vertical gradients differ");
@@ -324,7 +336,8 @@ mod tests {
     fn tiny_images_return_zero_gradients() {
         for (width, height) in [(0, 0), (1, 1), (2, 2), (2, 5), (5, 2)] {
             let img = GrayImage::new(width, height);
-            let (gx, gy) = compute_gradients(&img);
+            let fs = img.as_flat_samples();
+            let (gx, gy) = compute_gradients(&fs);
 
             assert_eq!(gx.dimensions(), (width, height));
             assert_eq!(gy.dimensions(), (width, height));
