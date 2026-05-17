@@ -53,7 +53,7 @@ pub fn good_features_to_track<B: AsRef<[u8]>>(
         .to_vec())
 }
 
-fn validate<B: AsRef<[u8]>>(fs: &FlatSamples<B>) -> Result<(), LayoutError> {
+pub(crate) fn validate<B: AsRef<[u8]>>(fs: &FlatSamples<B>) -> Result<(), LayoutError> {
     if fs.layout.channels != 1 {
         return Err(LayoutError::UnsupportedChannels(fs.layout.channels));
     }

@@ -15,7 +15,10 @@
 //!   and are infallible.
 //! - The [`generic`] module takes `&FlatSamples<B>` and returns `Result<_, LayoutError>` —
 //!   use it for zero-copy ingestion of subrects or NV12 Y planes.
+//! - For real-time tracking with zero per-frame allocations, build an
+//!   [`OpticalFlowBuffer`] via [`OpticalFlowBuilder`].
 
+mod buffer;
 mod error;
 mod features;
 mod lk;
@@ -24,7 +27,7 @@ mod utils;
 
 pub mod generic;
 
-// Re-export main functionality
+pub use buffer::{OpticalFlowBuffer, OpticalFlowBuilder};
 pub use error::{LayoutError, TrackError};
 pub use features::good_features_to_track;
 pub use lk::calc_optical_flow;
