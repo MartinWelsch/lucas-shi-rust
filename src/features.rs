@@ -65,7 +65,7 @@ impl FeaturesBuffer {
         non_maximum_suppression(&mut self.features, width, height, &mut self.is_local_max);
         filter_by_quality(&mut self.features, quality_level);
 
-        self.features.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(Ordering::Equal));
+        self.features.sort_unstable_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(Ordering::Equal));
         filter_by_distance_into(
             &self.features,
             min_distance,
