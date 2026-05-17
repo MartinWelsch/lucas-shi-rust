@@ -145,7 +145,7 @@ fn compute_min_eigenvalues_into(
 
             let trace = a_val + b_val;
             let discriminant = (a_val - b_val).pow(2) + 4 * c_val.pow(2);
-            let min_eigen = (((trace - discriminant) as f32).sqrt()) / 2.0;
+            let min_eigen = (trace as f32 - (discriminant as f32).sqrt()) / 2.0;
 
             out.push((x, y, min_eigen));
         }
