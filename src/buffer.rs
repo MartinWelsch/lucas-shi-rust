@@ -148,8 +148,8 @@ impl OpticalFlowBuffer {
         image: &FlatSamples<B>,
     ) -> Result<(), TrackError> {
         validate_dimensions(image, self.width, self.height)?;
-        crate::generic::validate(image)?;
-        let thinned = crate::generic::thin(image);
+        validate(image)?;
+        let thinned = thin(image);
 
         self.curr_pyramid.build_into(&thinned);
 
@@ -243,6 +243,41 @@ fn validate_dimensions<B: AsRef<[u8]>>(
         return Err(TrackError::DimensionMismatch { expected, actual });
     }
     Ok(())
+}
+
+fn validate<B: AsRef<[u8]>>(fs: &FlatSamples<B>) -> Result<(), crate::LayoutError> {
+    use crate::LayoutError;
+    if fs.layout.channels != 1 {
+        return Err(LayoutError::UnsupportedChannels(fs.layout.channels));
+    }
+    if fs.layout.width_stride != 1 {
+        return Err(LayoutError::UnsupportedWidthStride(fs.layout.width_stride));
+    }
+    let width = fs.layout.width;
+    let height = fs.layout.height;
+    if fs.layout.height_stride < width as usize {
+        return Err(LayoutError::OverlappingRows {
+            height_stride: fs.layout.height_stride,
+            width,
+        });
+    }
+    if width == 0 || height == 0 {
+        return Ok(());
+    }
+    let required = (height as usize - 1) * fs.layout.height_stride + width as usize;
+    let actual = fs.samples.as_ref().len();
+    if actual < required {
+        return Err(LayoutError::BufferTooSmall { required, actual });
+    }
+    Ok(())
+}
+
+fn thin<B: AsRef<[u8]>>(fs: &FlatSamples<B>) -> FlatSamples<&[u8]> {
+    FlatSamples {
+        samples: fs.samples.as_ref(),
+        layout: fs.layout,
+        color_hint: fs.color_hint,
+    }
 }
 
 #[cfg(test)]
@@ -340,6 +375,76 @@ mod tests {
         };
         let err = buf.push_frame(&view).unwrap_err();
         assert_eq!(err, TrackError::Layout(LayoutError::UnsupportedChannels(3)));
+    }
+
+    #[test]
+    fn layout_error_unsupported_width_stride() {
+        let mut buf = OpticalFlowBuilder::new(8, 8).build();
+        let data = vec![0u8; 8 * 8 * 2];
+        let view = FlatSamples {
+            samples: &data[..],
+            layout: SampleLayout {
+                channels: 1,
+                channel_stride: 1,
+                width: 8,
+                width_stride: 2,
+                height: 8,
+                height_stride: 16,
+            },
+            color_hint: None,
+        };
+        let err = buf.push_frame(&view).unwrap_err();
+        assert_eq!(err, TrackError::Layout(LayoutError::UnsupportedWidthStride(2)));
+    }
+
+    #[test]
+    fn layout_error_overlapping_rows() {
+        let mut buf = OpticalFlowBuilder::new(8, 8).build();
+        let data = vec![0u8; 8 * 8];
+        let view = FlatSamples {
+            samples: &data[..],
+            layout: SampleLayout {
+                channels: 1,
+                channel_stride: 1,
+                width: 8,
+                width_stride: 1,
+                height: 8,
+                height_stride: 4,
+            },
+            color_hint: None,
+        };
+        let err = buf.push_frame(&view).unwrap_err();
+        assert_eq!(
+            err,
+            TrackError::Layout(LayoutError::OverlappingRows {
+                height_stride: 4,
+                width: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn layout_error_buffer_too_small() {
+        let mut buf = OpticalFlowBuilder::new(8, 8).build();
+        let data = vec![0u8; 10];
+        let view = FlatSamples {
+            samples: &data[..],
+            layout: SampleLayout {
+                channels: 1,
+                channel_stride: 1,
+                width: 8,
+                width_stride: 1,
+                height: 8,
+                height_stride: 8,
+            },
+            color_hint: None,
+        };
+        let err = buf.push_frame(&view).unwrap_err();
+        // required = (height-1)*height_stride + width = 7*8 + 8 = 64; actual = 10.
+        assert_eq!(
+            err,
+            TrackError::Layout(LayoutError::BufferTooSmall { required: 64, actual: 10 })
+        );
     }
 
     #[test]

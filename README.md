@@ -39,15 +39,16 @@ let next_points = calc_optical_flow(&prev_frame_pyr, &next_frame_pyr, &prev_poin
 
 ## Zero-copy input — subrect or NV12 Y plane
 
-Use `optical_flow_lk::generic::*` to pass a subrect of a larger image or the Y plane of an
-NV12 buffer without copying. These functions accept `image::flat::FlatSamples<B>`, which
-carries a row stride and borrows its data; the existing top-level `build_pyramid` /
-`good_features_to_track` (taking `&GrayImage`) are unchanged.
+`OpticalFlowBuffer::push_frame` accepts any `&FlatSamples<B>` matching the
+buffer's configured resolution. Subrects of larger images and NV12 Y planes
+(possibly with row padding) are zero-copy.
 
 ### Subrect of a larger `GrayImage`
 
 ```rust
-use optical_flow_lk::{generic, FlatSamples, SampleLayout};
+use optical_flow_lk::{FlatSamples, OpticalFlowBuilder, SampleLayout};
+
+let mut buf = OpticalFlowBuilder::new(w, h).build();
 
 let stride = big.width() as usize;
 let off = oy as usize * stride + ox as usize;
@@ -60,14 +61,15 @@ let view = FlatSamples {
     },
     color_hint: None,
 };
-let pyramid = generic::build_pyramid(&view, 4)?;
+buf.push_frame(&view)?;
 ```
 
 ### NV12 Y plane (full or subrect)
 
 ```rust
-use optical_flow_lk::{generic, FlatSamples, SampleLayout};
+use optical_flow_lk::{FlatSamples, OpticalFlowBuilder, SampleLayout};
 
+let mut buf = OpticalFlowBuilder::new(width, height).build();
 let view = FlatSamples {
     samples: &nv12_buffer[..],
     layout: SampleLayout {
@@ -77,13 +79,12 @@ let view = FlatSamples {
     },
     color_hint: None,
 };
-let pyramid = generic::build_pyramid(&view, 4)?;
+buf.push_frame(&view)?;
 ```
 
-The `generic::*` functions validate the layout once at entry and return
-`Result<_, LayoutError>`. The four error variants — `UnsupportedChannels`,
-`UnsupportedWidthStride`, `OverlappingRows`, `BufferTooSmall` — cover only conditions that
-would cause wrong output or out-of-bounds reads.
+`push_frame` returns `Err(TrackError::Layout(LayoutError::…))` if the
+`FlatSamples` layout cannot be safely consumed — see [`TrackError`] /
+[`LayoutError`].
 
 ## Real-time tracking — `OpticalFlowBuffer`
 

@@ -9,7 +9,7 @@ use std::cell::Cell;
 use std::sync::Mutex;
 
 use image::flat::{FlatSamples, SampleLayout};
-use optical_flow_lk::{OpticalFlowBuilder, generic};
+use optical_flow_lk::OpticalFlowBuilder;
 
 struct CountingAllocator;
 
@@ -75,55 +75,6 @@ fn checkerboard(width: u32, height: u32, cell: u32) -> Vec<u8> {
         }
     }
     out
-}
-
-// ----- Upper-bound assertions for the legacy generic path -----
-//
-// Measured on initial v0.4.0 implementation. Bump these only after a deliberate
-// review of the new allocation site. To find the current measured value: set
-// the constant to 0 and read the failure message.
-
-const MAX_ALLOCS_GENERIC_BUILD_PYRAMID: usize = 4;
-const MAX_ALLOCS_GENERIC_FEATURES: usize = 11;
-
-#[test]
-fn generic_build_pyramid_allocations_within_bound() {
-    let frame = vec![0u8; 256 * 256];
-    let view = make_view(&frame, 256, 256);
-
-    // Warm-up — first call may trigger one-time setup.
-    let _ = generic::build_pyramid(&view, 3).unwrap();
-
-    let n_alloc = measure(|| {
-        let _ = generic::build_pyramid(&view, 3).unwrap();
-    });
-
-    assert!(
-        n_alloc <= MAX_ALLOCS_GENERIC_BUILD_PYRAMID,
-        "generic::build_pyramid allocated {n_alloc} times \
-         (upper bound {MAX_ALLOCS_GENERIC_BUILD_PYRAMID}). \
-         If this increase is intentional and justified, bump the bound \
-         after reviewing the new allocation site."
-    );
-}
-
-#[test]
-fn generic_good_features_allocations_within_bound() {
-    let frame = checkerboard(256, 256, 8);
-    let view = make_view(&frame, 256, 256);
-    let _ = generic::good_features_to_track(&view, 0.4, 10).unwrap();
-
-    let n_alloc = measure(|| {
-        let _ = generic::good_features_to_track(&view, 0.4, 10).unwrap();
-    });
-
-    assert!(
-        n_alloc <= MAX_ALLOCS_GENERIC_FEATURES,
-        "generic::good_features_to_track allocated {n_alloc} times \
-         (upper bound {MAX_ALLOCS_GENERIC_FEATURES}). \
-         If this increase is intentional and justified, bump the bound \
-         after reviewing the new allocation site."
-    );
 }
 
 // ----- Strict zero-allocation assertion for the buffer path -----

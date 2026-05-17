@@ -13,10 +13,10 @@
 //!
 //! - Top-level functions ([`build_pyramid`], [`good_features_to_track`]) take `&GrayImage`
 //!   and are infallible.
-//! - The [`generic`] module takes `&FlatSamples<B>` and returns `Result<_, LayoutError>` —
-//!   use it for zero-copy ingestion of subrects or NV12 Y planes.
 //! - For real-time tracking with zero per-frame allocations, build an
-//!   [`OpticalFlowBuffer`] via [`OpticalFlowBuilder`].
+//!   [`OpticalFlowBuffer`] via [`OpticalFlowBuilder`]. `push_frame` accepts any
+//!   `&FlatSamples<B>` matching the configured resolution — including subrects
+//!   of larger images and the Y plane of an NV12 buffer.
 
 mod buffer;
 mod error;
@@ -24,8 +24,6 @@ mod features;
 mod lk;
 mod pyramid;
 mod utils;
-
-pub mod generic;
 
 pub use buffer::{OpticalFlowBuffer, OpticalFlowBuilder};
 pub use error::{LayoutError, TrackError};
