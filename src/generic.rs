@@ -11,7 +11,6 @@ use image::GrayImage;
 
 use crate::LayoutError;
 use crate::features::good_features_to_track_impl;
-use crate::pyramid::build_pyramid_impl;
 
 /// Build a Gaussian-style pyramid from any single-channel buffer.
 ///
@@ -26,7 +25,13 @@ pub fn build_pyramid<B: AsRef<[u8]>>(
     levels: usize,
 ) -> Result<Vec<GrayImage>, LayoutError> {
     validate(image)?;
-    Ok(build_pyramid_impl(&thin(image), levels))
+    let mut buf = crate::pyramid::PyramidBuffer::with_capacity(
+        image.layout.width,
+        image.layout.height,
+        levels,
+    );
+    buf.build_into(&thin(image));
+    Ok(buf.into_levels())
 }
 
 /// Find good features to track from any single-channel buffer.
