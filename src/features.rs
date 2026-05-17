@@ -1,4 +1,4 @@
-use image::{GrayImage, ImageBuffer, Luma};
+use image::{flat::FlatSamples, GrayImage, ImageBuffer, Luma};
 use std::cmp::Ordering;
 
 use crate::utils::{box_filter_3x3::box_filter_3x3_in_place, fast_gradients::compute_gradients};
@@ -18,8 +18,16 @@ pub fn good_features_to_track(
     quality_level: f32,
     min_distance: u32,
 ) -> Vec<(u32, u32, f32)> {
+    good_features_to_track_impl(&image.as_flat_samples(), quality_level, min_distance)
+}
+
+pub(crate) fn good_features_to_track_impl(
+    image: &FlatSamples<&[u8]>,
+    quality_level: f32,
+    min_distance: u32,
+) -> Vec<(u32, u32, f32)> {
     // Compute gradients
-    let (gx, gy) = compute_gradients(&image.as_flat_samples());
+    let (gx, gy) = compute_gradients(image);
 
     // Compute squared gradients and their product
     let (mut ix_sq, mut iy_sq, mut ix_iy) = compute_gradient_products(&gx, &gy);
@@ -33,7 +41,7 @@ pub fn good_features_to_track(
     let mut features = compute_min_eigenvalues(&ix_sq, &iy_sq, &ix_iy);
 
     // Non-maximum suppression
-    non_maximum_suppression(&mut features, image.width(), image.height());
+    non_maximum_suppression(&mut features, gx.width(), gx.height());
 
     // Filter by quality
     filter_by_quality(&mut features, quality_level);
@@ -42,7 +50,7 @@ pub fn good_features_to_track(
     features.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(Ordering::Equal));
 
     // Filter by distance
-    filter_by_distance(&features, min_distance, image.width(), image.height())
+    filter_by_distance(&features, min_distance, gx.width(), gx.height())
 }
 
 type GradientProduct = (
