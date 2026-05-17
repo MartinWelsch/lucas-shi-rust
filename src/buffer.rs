@@ -149,7 +149,7 @@ impl OpticalFlowBuffer {
     ) -> Result<(), TrackError> {
         validate_dimensions(image, self.width, self.height)?;
         crate::generic::validate(image)?;
-        let thinned = thin_flat_samples(image);
+        let thinned = crate::generic::thin(image);
 
         self.curr_pyramid.build_into(&thinned);
 
@@ -158,7 +158,6 @@ impl OpticalFlowBuffer {
                 self.prev_pyramid.levels(),
                 self.curr_pyramid.levels(),
                 &mut self.points,
-                self.window_size,
                 self.max_iterations,
             );
         }
@@ -244,14 +243,6 @@ fn validate_dimensions<B: AsRef<[u8]>>(
         return Err(TrackError::DimensionMismatch { expected, actual });
     }
     Ok(())
-}
-
-fn thin_flat_samples<B: AsRef<[u8]>>(fs: &FlatSamples<B>) -> FlatSamples<&[u8]> {
-    FlatSamples {
-        samples: fs.samples.as_ref(),
-        layout: fs.layout,
-        color_hint: fs.color_hint,
-    }
 }
 
 #[cfg(test)]

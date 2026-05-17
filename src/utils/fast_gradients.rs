@@ -6,31 +6,10 @@ use std::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+#[allow(dead_code)]
 const HORIZONTAL_SCHARR_3X3_OLD: [i32; 9] = [-3, 0, 3, -10, 0, 10, -3, 0, 3];
+#[allow(dead_code)]
 const VERTICAL_SCHARR_3X3_OLD: [i32; 9] = [-3, -10, -3, 0, 0, 0, 3, 10, 3];
-
-type GradientProduct = (
-    ImageBuffer<Luma<i16>, Vec<i16>>,
-    ImageBuffer<Luma<i16>, Vec<i16>>,
-);
-
-/// Computes signed Scharr gradients.
-///
-/// Allocates fresh `ImageBuffer<Luma<i16>, Vec<i16>>` output buffers.
-/// For an allocation-free variant, see [`compute_gradients_into`].
-///
-/// Selection is done per target:
-/// - `aarch64`: NEON
-/// - `x86`/`x86_64`: runtime AVX2 detection, otherwise scalar fallback
-/// - everything else: historical scalar implementation
-pub fn compute_gradients(image: &FlatSamples<&[u8]>) -> GradientProduct {
-    let width = image.layout.width;
-    let height = image.layout.height;
-    let mut grad_x: ImageBuffer<Luma<i16>, Vec<i16>> = ImageBuffer::new(width, height);
-    let mut grad_y: ImageBuffer<Luma<i16>, Vec<i16>> = ImageBuffer::new(width, height);
-    compute_gradients_into(image, &mut grad_x, &mut grad_y);
-    (grad_x, grad_y)
-}
 
 /// Compute gradients into caller-provided buffers. No heap allocation.
 ///
@@ -85,6 +64,7 @@ fn compute_gradients_into_dispatch(
     compute_gradients_manual_into(image, &HORIZONTAL_SCHARR_3X3_OLD, &VERTICAL_SCHARR_3X3_OLD, grad_x, grad_y);
 }
 
+#[allow(dead_code)]
 fn compute_gradients_manual_into(
     image: &FlatSamples<&[u8]>,
     kernel_x: &[i32; 9],
@@ -120,23 +100,6 @@ fn compute_gradients_manual_into(
             grad_y.put_pixel(x, y, Luma([gy as i16]));
         }
     }
-}
-
-/// Test-only wrapper around `compute_gradients_manual_into` that returns a
-/// fresh tuple, preserving the existing `selected_gradients_match_manual_reference`
-/// test contract.
-#[cfg(test)]
-fn compute_gradients_manual(
-    image: &FlatSamples<&[u8]>,
-    kernel_x: &[i32; 9],
-    kernel_y: &[i32; 9],
-) -> GradientProduct {
-    let width = image.layout.width;
-    let height = image.layout.height;
-    let mut grad_x = ImageBuffer::new(width, height);
-    let mut grad_y = ImageBuffer::new(width, height);
-    compute_gradients_manual_into(image, kernel_x, kernel_y, &mut grad_x, &mut grad_y);
-    (grad_x, grad_y)
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -372,13 +335,23 @@ mod tests {
     fn selected_gradients_match_manual_reference() {
         let img = make_test_image(128, 96);
         let fs = img.as_flat_samples();
-        let expected = compute_gradients_manual(
-            &fs, &HORIZONTAL_SCHARR_3X3_OLD, &VERTICAL_SCHARR_3X3_OLD,
-        );
-        let actual = compute_gradients(&fs);
 
-        assert_eq!(expected.0, actual.0, "horizontal gradients differ");
-        assert_eq!(expected.1, actual.1, "vertical gradients differ");
+        let mut expected_x = ImageBuffer::new(128, 96);
+        let mut expected_y = ImageBuffer::new(128, 96);
+        compute_gradients_manual_into(
+            &fs,
+            &HORIZONTAL_SCHARR_3X3_OLD,
+            &VERTICAL_SCHARR_3X3_OLD,
+            &mut expected_x,
+            &mut expected_y,
+        );
+
+        let mut actual_x = ImageBuffer::new(128, 96);
+        let mut actual_y = ImageBuffer::new(128, 96);
+        compute_gradients_into(&fs, &mut actual_x, &mut actual_y);
+
+        assert_eq!(expected_x, actual_x, "horizontal gradients differ");
+        assert_eq!(expected_y, actual_y, "vertical gradients differ");
     }
 
     #[test]
@@ -386,7 +359,9 @@ mod tests {
         for (width, height) in [(0, 0), (1, 1), (2, 2), (2, 5), (5, 2)] {
             let img = GrayImage::new(width, height);
             let fs = img.as_flat_samples();
-            let (gx, gy) = compute_gradients(&fs);
+            let mut gx = ImageBuffer::new(width, height);
+            let mut gy = ImageBuffer::new(width, height);
+            compute_gradients_into(&fs, &mut gx, &mut gy);
 
             assert_eq!(gx.dimensions(), (width, height));
             assert_eq!(gy.dimensions(), (width, height));

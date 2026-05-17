@@ -80,7 +80,7 @@ pub(crate) fn validate<B: AsRef<[u8]>>(fs: &FlatSamples<B>) -> Result<(), Layout
     Ok(())
 }
 
-fn thin<B: AsRef<[u8]>>(fs: &FlatSamples<B>) -> FlatSamples<&[u8]> {
+pub(crate) fn thin<B: AsRef<[u8]>>(fs: &FlatSamples<B>) -> FlatSamples<&[u8]> {
     FlatSamples {
         samples: fs.samples.as_ref(),
         layout: fs.layout,

@@ -12,6 +12,7 @@ pub(crate) struct LkBuffer {
     iy_patch: Vec<f32>,
     displacements: Vec<(f32, f32)>,
     offsets: Vec<(f32, f32)>,
+    window_size: usize,
 }
 
 impl LkBuffer {
@@ -50,6 +51,7 @@ impl LkBuffer {
             iy_patch: vec![0.0; n_pixels],
             displacements: Vec::new(),
             offsets: build_window_offsets(radius),
+            window_size,
         }
     }
 
@@ -61,15 +63,12 @@ impl LkBuffer {
         prev_pyramid: &[GrayImage],
         curr_pyramid: &[GrayImage],
         points: &mut Vec<(f32, f32)>,
-        window_size: usize,
         max_iterations: usize,
     ) {
         assert_eq!(prev_pyramid.len(), curr_pyramid.len());
-        assert!(window_size % 2 == 1, "Window size must be odd");
-        debug_assert_eq!(self.prev_patch.len(), window_size * window_size);
 
         let n_levels = prev_pyramid.len();
-        let radius = window_size / 2;
+        let radius = self.window_size / 2;
         let epsilon = 1e-3;
         let det_epsilon = 1e-6;
 
@@ -184,7 +183,6 @@ pub fn calc_optical_flow(
         prev_pyramid,
         curr_pyramid,
         &mut points,
-        window_size,
         max_iterations,
     );
     points
