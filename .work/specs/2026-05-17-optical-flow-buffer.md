@@ -1,6 +1,6 @@
 # Spec: `OpticalFlowBuilder` / `OpticalFlowBuffer` — Allocation-Free Per-Frame Pipeline
 
-**Status:** Draft (rev 9)
+**Status:** Draft (rev 10)
 **Date:** 2026-05-17
 **Scope:** New public types `OpticalFlowBuilder` and `OpticalFlowBuffer` for a steady-state, zero-per-frame-allocation tracking loop. Existing `build_pyramid`, `good_features_to_track`, `calc_optical_flow`, and `generic::*` APIs unchanged.
 
@@ -87,11 +87,29 @@ impl OpticalFlowBuilder {
 
 Defaults are chosen to match the values used in `examples/optical_flow.rs` so first-time callers get sensible behavior.
 
-### 4.2 `OpticalFlowBuffer`
+### 4.2 `Feature` and `OpticalFlowBuffer`
 
-All fields are private. The caller manages its own feature-point buffers and
-passes them into `good_features_to_track` and `calculate_flow`. There are no
-public fields — this enforces the lifecycle contract and keeps the internal
+#### `Feature`
+
+```rust
+/// A tracked feature point with spatial position and detection strength.
+///
+/// `strength` is the Shi-Tomasi min-eigenvalue from feature detection
+/// (always >= 0). Features produced by `calculate_flow` inherit their input
+/// feature's strength unchanged.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Feature {
+    pub x: f32,
+    pub y: f32,
+    pub strength: f32,
+}
+```
+
+#### `OpticalFlowBuffer`
+
+All fields are private. Feature lists are owned by the buffer and are read
+through `current_features()` / `previous_features()`. There are no public
+fields — this enforces the lifecycle contract and keeps the internal
 representation free to evolve.
 
 ```rust
@@ -105,11 +123,12 @@ pub struct OpticalFlowBuffer {
     feature_quality_level: f32,
     feature_min_distance: u32,
 
-    // Reusable storage:
-    prev_pyramid: PyramidBuffer,
-    curr_pyramid: PyramidBuffer,
-    lk_buffer:   LkBuffer,
+    // Reusable storage (each FrameBuffer holds a pyramid + feature list):
+    prev_frame: FrameBuffer,
+    curr_frame: FrameBuffer,
+    lk_buffer: LkBuffer,
     features_buffer: FeaturesBuffer,
+    staging_positions: Vec<(f32, f32)>,  // reusable LK input scratch
 
     // Lifecycle:
     has_curr: bool,
@@ -119,40 +138,39 @@ pub struct OpticalFlowBuffer {
 impl OpticalFlowBuffer {
     // --- mutation: tracking pipeline ---
 
-    /// Build a pyramid from `image` and rotate the buffer's pyramid storage
-    /// so that `curr_pyramid` holds the just-pushed frame and `prev_pyramid`
-    /// holds the previously-pushed frame (if any).
-    ///
-    /// Does not run optical flow. Does not touch any feature list.
-    /// Swap-then-build order: prev/curr are swapped first, then the new frame
-    /// is built into curr.
+    /// Rotate prev/curr and build the new frame's pyramid into curr.
+    /// Clears `curr_frame.features` (the new frame has no features yet).
     pub fn push_frame<B: AsRef<[u8]>>(
         &mut self,
         image: &FlatSamples<B>,
     ) -> Result<(), TrackError>;
 
-    /// Detect Shi-Tomasi features on the most recently pushed frame and write
-    /// their positions into `out` (cleared first). Uses the builder's
+    /// Detect Shi-Tomasi features on the current frame and write them into
+    /// `current_features()` (cleared first). Uses the builder's
     /// `feature_quality_level` and `feature_min_distance` settings.
-    /// Quality scores are dropped.
+    /// Each feature carries its Shi-Tomasi min-eigenvalue as `strength`.
     ///
     /// Errors with `TrackError::NoCurrentFrame` if no frame has been pushed.
-    pub fn good_features_to_track(
-        &mut self,
-        out: &mut Vec<(f32, f32)>,
-    ) -> Result<(), TrackError>;
+    pub fn good_features_to_track(&mut self) -> Result<(), TrackError>;
 
-    /// Track `features` from the previous frame into the current frame using
-    /// Lucas-Kanade. Writes the new positions into `out_features` (cleared
-    /// first; sized to `features.len()`).
+    /// Track `previous_features()` from the previous frame into the current
+    /// frame using Lucas-Kanade. Writes results into `current_features()`
+    /// (cleared first). Strength is preserved from each input feature.
     ///
     /// Errors with `TrackError::NoPreviousFrame` if fewer than two frames
     /// have been pushed.
-    pub fn calculate_flow(
-        &mut self,
-        features: &[(f32, f32)],
-        out_features: &mut Vec<(f32, f32)>,
-    ) -> Result<(), TrackError>;
+    pub fn calculate_flow(&mut self) -> Result<(), TrackError>;
+
+    // --- access: feature lists ---
+
+    /// Features for the most recently pushed frame (empty until
+    /// `good_features_to_track` or `calculate_flow` is called after the
+    /// last `push_frame`).
+    pub fn current_features(&self) -> &[Feature];
+
+    /// Features for the frame prior to the most recently pushed one (empty
+    /// until a second `push_frame` has been called).
+    pub fn previous_features(&self) -> &[Feature];
 
     // --- access: lifecycle and configuration (read-only) ---
 
@@ -207,42 +225,42 @@ impl std::error::Error for TrackError { ... }
 State machine trace:
 
 ```
-Initial: prev = ~, curr = ~, has_curr = false, has_prev = false
+Initial:
+  prev_frame = { pyramid: ~, features: [] }
+  curr_frame = { pyramid: ~, features: [] }
+  has_curr = false, has_prev = false
 
 push_frame(f0):
-  validate(...)?
-  swap(prev, curr)              // both ~ — no visible change
-  curr.build_into(f0)           // curr = f0
-  // has_curr was false, so has_prev stays false
+  swap (no-op effectively)
+  curr_frame.pyramid.build_into(f0)
+  curr_frame.features.clear()  // already empty
   has_curr = true
-  // Now: prev = ~, curr = f0, has_curr = true, has_prev = false
+  State: prev = { ~, [] }, curr = { f0, [] }
 
-good_features_to_track(&mut points):
-  has_curr is true, proceed
-  detect on curr.level(0) = f0
-  write features into points (cleared first)
+good_features_to_track():
+  detect on curr.pyramid.level(0) = f0
+  curr_frame.features = features_in_f0 (each as Feature { x, y, strength })
+  State: prev = { ~, [] }, curr = { f0, F0 }
+  current_features() == F0, previous_features() == []
 
 push_frame(f1):
-  swap                           // prev = f0, curr = ~
-  curr.build_into(f1)            // prev = f0, curr = f1
-  // has_curr was true, so has_prev becomes true
-  has_curr stays true
+  swap → prev = { f0, F0 }, curr = { ~, [] }  (old prev's features moved to curr)
+  curr_frame.pyramid.build_into(f1)
+  curr_frame.features.clear()  // discard stale features moved in by the swap
   has_prev = true
+  State: prev = { f0, F0 }, curr = { f1, [] }
 
-calculate_flow(&points, &mut new_points):
-  has_prev is true, proceed
-  new_points.clear()
-  new_points.extend_from_slice(&points)
-  lk_buffer.calc_into(prev.levels()=f0, curr.levels()=f1, &mut new_points, max_iterations)
-
-push_frame(f2):
-  swap                           // prev = f1, curr = f0 (stale)
-  curr.build_into(f2)            // prev = f1, curr = f2
-  has_prev stays true
-
-calculate_flow(&new_points, &mut newer_points):
-  lk: prev=f1, curr=f2, features in f1 coords -> tracked in f2
+calculate_flow():
+  staging_positions = positions from prev_frame.features (= F0 positions)
+  lk_buffer.calc_into(prev=f0, curr=f1, &mut staging_positions, max_iter)
+  curr_frame.features = zip(prev.features, staging).map(prev.strength + new pos)
+  State: prev = { f0, F0 }, curr = { f1, F1_tracked }
+  current_features() = features tracked into f1
+  previous_features() = original features in f0
 ```
+
+The clear-on-push in `push_frame` is load-bearing: without it, stale features
+from two frames ago would resurface after each swap.
 
 Equivalent Rust sketch:
 
@@ -251,40 +269,41 @@ Equivalent Rust sketch:
 let mut buf = OpticalFlowBuilder::new(W, H).build();
 // buf.has_current_frame() == false, buf.has_previous_frame() == false
 
-let mut points: Vec<(f32, f32)> = Vec::new();
-let mut tracked: Vec<(f32, f32)> = Vec::new();
-
 // 1. First frame primes curr; no flow yet.
 buf.push_frame(&f0)?;
 // has_current_frame() == true, has_previous_frame() == false
+// current_features() is empty (push clears it)
 
 // 2. Detect features on curr (= f0).
-buf.good_features_to_track(&mut points)?;
+buf.good_features_to_track()?;
+// current_features() == F0
 
-// 3. Second frame rotates: prev=f0, curr=f1.
+// 3. Second frame rotates: prev = { f0, F0 }, curr = { f1, [] }
 buf.push_frame(&f1)?;
 // has_previous_frame() == true
+// previous_features() == F0, current_features() is empty
 
 // 4. Track from f0 -> f1.
-buf.calculate_flow(&points, &mut tracked)?;
-std::mem::swap(&mut points, &mut tracked);
+buf.calculate_flow()?;
+// current_features() = F1 (tracked positions, strength preserved)
+// previous_features() = F0 (unchanged)
 
 // 5. Continue for f2, f3, ...
 buf.push_frame(&f2)?;
-buf.calculate_flow(&points, &mut tracked)?;
-std::mem::swap(&mut points, &mut tracked);
+buf.calculate_flow()?;
 
 // 6. Re-detect at any time after at least one push_frame.
-buf.good_features_to_track(&mut points)?;
+buf.push_frame(&f3)?;
+buf.good_features_to_track()?;  // re-seeds curr with fresh detections
 ```
 
 Rules:
-- `push_frame` always performs swap-then-build: `swap(prev, curr)` first, then `curr.build_into(image)`. It never runs optical flow.
+- `push_frame` always performs swap-then-build: `swap(prev_frame, curr_frame)` first, then `curr_frame.pyramid.build_into(image)`, then `curr_frame.features.clear()`. It never runs optical flow.
 - `has_curr` flips to `true` on the first `push_frame` call.
 - `has_prev` flips to `true` on the second `push_frame` call (i.e., when `has_curr` was already `true` at the start of `push_frame`).
-- `good_features_to_track` requires `has_curr`; detects on `curr_pyramid`.
-- `calculate_flow` requires `has_prev`; runs LK between `prev_pyramid` and `curr_pyramid`.
-- The caller manages feature-point buffers; a typical loop calls `std::mem::swap(&mut points, &mut tracked)` after each `calculate_flow`.
+- `good_features_to_track` requires `has_curr`; detects on `curr_frame.pyramid` and writes into `curr_frame.features`.
+- `calculate_flow` requires `has_prev`; reads `prev_frame.features` positions, runs LK between `prev_frame.pyramid` and `curr_frame.pyramid`, writes `curr_frame.features` with preserved strengths.
+- Feature lists travel with their owning `FrameBuffer` through the prev/curr swap, so `previous_features()` always reflects "the frame we just tracked from".
 
 ### 4.5 Re-exports
 
@@ -899,7 +918,7 @@ Under "Changed":
 
 - **Feature detection buffer sizing.** `FeaturesBuffer` is allocated eagerly at `build()` with best-effort upper-bound sizes (see §5.3). For 1920×1080 this costs roughly 50 MB total across the i16 buffers, the features Vec, the is_local_max Vec, and the grid. This is intentional: the whole point of the buffer type is predictable steady-state allocation, including the first frame after a `good_features_to_track()` call. Callers that cannot afford this upfront cost should keep using the free-function `good_features_to_track` instead.
 
-- **Caller-managed point buffers.** The caller owns `Vec<(f32, f32)>` and passes it into `good_features_to_track` and `calculate_flow`. The caller is responsible for warm-up (pre-sizing the Vec before entering the steady-state loop). This is more flexible than owning the Vec internally and avoids ambiguity about when the buffer should grow or shrink.
+- **Buffer-owned feature lists.** `OpticalFlowBuffer` owns two `Vec<Feature>` slices (one per `FrameBuffer`) and a `staging_positions: Vec<(f32, f32)>` scratch buffer for the LK call. All three grow during warm-up to their steady-state size and are reused thereafter. Callers read features through `current_features()` and `previous_features()` without any ownership transfer. This is simpler than the previous caller-managed-Vec design and preserves zero-alloc behavior after warm-up.
 
 - **Thread safety.** `OpticalFlowBuffer` is naturally `Send` if its components are. We do not promise `Sync`; concurrent `push_frame` is undefined. Documented.
 

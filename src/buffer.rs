@@ -19,6 +19,37 @@ const DEFAULT_MAX_ITERATIONS: usize = 30;
 const DEFAULT_FEATURE_QUALITY_LEVEL: f32 = 0.4;
 const DEFAULT_FEATURE_MIN_DISTANCE: u32 = 10;
 
+/// A tracked feature point with spatial position and detection strength.
+///
+/// `strength` is the Shi-Tomasi min-eigenvalue from feature detection
+/// (always >= 0). Features produced by
+/// [`calculate_flow`](OpticalFlowBuffer::calculate_flow) inherit their input
+/// feature's strength unchanged.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Feature {
+    pub x: f32,
+    pub y: f32,
+    pub strength: f32,
+}
+
+/// Pyramid image data plus the features associated with that frame.
+///
+/// `features` starts empty after construction or after a `push_frame` rotation;
+/// it is populated by `good_features_to_track` or `calculate_flow`.
+pub(crate) struct FrameBuffer {
+    pyramid: PyramidBuffer,
+    features: Vec<Feature>,
+}
+
+impl FrameBuffer {
+    pub(crate) fn with_capacity(width: u32, height: u32, levels: usize) -> Self {
+        Self {
+            pyramid: PyramidBuffer::with_capacity(width, height, levels),
+            features: Vec::new(),
+        }
+    }
+}
+
 /// Builder for [`OpticalFlowBuffer`].
 pub struct OpticalFlowBuilder {
     width: u32,
@@ -82,8 +113,8 @@ impl OpticalFlowBuilder {
         assert!(self.pyramid_levels > 0, "pyramid_levels must be > 0");
         assert!(self.window_size % 2 == 1, "window_size must be odd");
 
-        let prev_pyramid = PyramidBuffer::with_capacity(self.width, self.height, self.pyramid_levels);
-        let curr_pyramid = PyramidBuffer::with_capacity(self.width, self.height, self.pyramid_levels);
+        let prev_frame = FrameBuffer::with_capacity(self.width, self.height, self.pyramid_levels);
+        let curr_frame = FrameBuffer::with_capacity(self.width, self.height, self.pyramid_levels);
         let lk_buffer = LkBuffer::with_capacity(
             self.width,
             self.height,
@@ -104,10 +135,11 @@ impl OpticalFlowBuilder {
             max_iterations: self.max_iterations,
             feature_quality_level: self.feature_quality_level,
             feature_min_distance: self.feature_min_distance,
-            prev_pyramid,
-            curr_pyramid,
+            prev_frame,
+            curr_frame,
             lk_buffer,
             features_buffer,
+            staging_positions: Vec::new(),
             has_curr: false,
             has_prev: false,
         }
@@ -116,10 +148,10 @@ impl OpticalFlowBuilder {
 
 /// Steady-state tracking pipeline.
 ///
-/// All state is private. Read access goes through the accessors below; callers
-/// manage their own feature-point buffers and pass them into
-/// [`good_features_to_track`](Self::good_features_to_track) and
-/// [`calculate_flow`](Self::calculate_flow).
+/// All state is private. Read access to detected/tracked features goes through
+/// [`current_features`](Self::current_features) and
+/// [`previous_features`](Self::previous_features); configuration is exposed
+/// through the remaining read-only accessors.
 pub struct OpticalFlowBuffer {
     width: u32,
     height: u32,
@@ -129,23 +161,21 @@ pub struct OpticalFlowBuffer {
     feature_quality_level: f32,
     feature_min_distance: u32,
 
-    prev_pyramid: PyramidBuffer,
-    curr_pyramid: PyramidBuffer,
+    prev_frame: FrameBuffer,
+    curr_frame: FrameBuffer,
     lk_buffer: LkBuffer,
     features_buffer: FeaturesBuffer,
+    /// Reusable staging Vec for the LK call (LkBuffer takes `Vec<(f32, f32)>`).
+    /// Grows during warm-up to the steady-state feature count, then reused.
+    staging_positions: Vec<(f32, f32)>,
 
     has_curr: bool,
     has_prev: bool,
 }
 
 impl OpticalFlowBuffer {
-    /// Build a pyramid from `image` and rotate the buffer's pyramid storage
-    /// so that `curr_pyramid` holds the just-pushed frame and `prev_pyramid`
-    /// holds the previously-pushed frame (if any).
-    ///
-    /// Does not run optical flow — call [`calculate_flow`](Self::calculate_flow)
-    /// after at least two `push_frame` calls. Does not touch any feature list —
-    /// the caller manages those.
+    /// Rotate prev/curr and build the new frame's pyramid into curr.
+    /// Clears `curr_frame.features` (the new frame has no features yet).
     pub fn push_frame<B: AsRef<[u8]>>(
         &mut self,
         image: &FlatSamples<B>,
@@ -154,9 +184,9 @@ impl OpticalFlowBuffer {
         validate(image)?;
         let thinned = thin(image);
 
-        // Rotate: previous curr becomes prev, then build the new frame into curr.
-        std::mem::swap(&mut self.prev_pyramid, &mut self.curr_pyramid);
-        self.curr_pyramid.build_into(&thinned);
+        std::mem::swap(&mut self.prev_frame, &mut self.curr_frame);
+        self.curr_frame.pyramid.build_into(&thinned);
+        self.curr_frame.features.clear();
 
         if self.has_curr {
             self.has_prev = true;
@@ -165,58 +195,80 @@ impl OpticalFlowBuffer {
         Ok(())
     }
 
-    /// Detect Shi-Tomasi features on the most recently pushed frame and
-    /// write their positions into `out` (cleared first). The output is in
-    /// the same coordinate system the next [`calculate_flow`](Self::calculate_flow)
-    /// will use.
-    ///
-    /// Quality scores are dropped — if you need them, use the legacy
-    /// `good_features_to_track` free function.
-    ///
-    /// Errors with [`TrackError::NoCurrentFrame`] if no frame has been pushed.
-    pub fn good_features_to_track(
-        &mut self,
-        out: &mut Vec<(f32, f32)>,
-    ) -> Result<(), TrackError> {
+    /// Detect Shi-Tomasi features on the current frame and write them into
+    /// `current_features()` (cleared first). Errors `NoCurrentFrame` if no
+    /// frame has been pushed.
+    pub fn good_features_to_track(&mut self) -> Result<(), TrackError> {
         if !self.has_curr {
             return Err(TrackError::NoCurrentFrame);
         }
-        let level0 = self.curr_pyramid.levels()[0].as_flat_samples();
+        let level0 = self.curr_frame.pyramid.levels()[0].as_flat_samples();
         let detected = self.features_buffer.detect_into(
             &level0,
             self.feature_quality_level,
             self.feature_min_distance,
         );
-        out.clear();
-        out.extend(detected.iter().map(|&(x, y, _)| (x as f32, y as f32)));
+        self.curr_frame.features.clear();
+        self.curr_frame.features.extend(
+            detected.iter().map(|&(x, y, q)| Feature {
+                x: x as f32,
+                y: y as f32,
+                strength: q,
+            }),
+        );
         Ok(())
     }
 
-    /// Track `features` from the previous frame into the current frame using
-    /// Lucas-Kanade. Writes the new positions into `out_features` (cleared
-    /// first; sized to `features.len()`). The caller typically calls
-    /// `std::mem::swap(&mut features, &mut out_features)` afterwards so the
-    /// fresh positions become the input for the next iteration.
-    ///
-    /// Errors with [`TrackError::NoPreviousFrame`] if fewer than two frames
-    /// have been pushed.
-    pub fn calculate_flow(
-        &mut self,
-        features: &[(f32, f32)],
-        out_features: &mut Vec<(f32, f32)>,
-    ) -> Result<(), TrackError> {
+    /// Track `previous_features()` from the previous frame into the current
+    /// frame using Lucas-Kanade. Writes results into `current_features()`
+    /// (cleared first). Strength is preserved from each input feature.
+    /// Errors `NoPreviousFrame` if fewer than two frames have been pushed.
+    pub fn calculate_flow(&mut self) -> Result<(), TrackError> {
         if !self.has_prev {
             return Err(TrackError::NoPreviousFrame);
         }
-        out_features.clear();
-        out_features.extend_from_slice(features);
+
+        // Stage previous positions for LK.
+        self.staging_positions.clear();
+        self.staging_positions
+            .extend(self.prev_frame.features.iter().map(|f| (f.x, f.y)));
+
         self.lk_buffer.calc_into(
-            self.prev_pyramid.levels(),
-            self.curr_pyramid.levels(),
-            out_features,
+            self.prev_frame.pyramid.levels(),
+            self.curr_frame.pyramid.levels(),
+            &mut self.staging_positions,
             self.max_iterations,
         );
+
+        self.curr_frame.features.clear();
+        self.curr_frame.features.extend(
+            self.prev_frame
+                .features
+                .iter()
+                .zip(self.staging_positions.iter())
+                .map(|(prev, &(x, y))| Feature {
+                    x,
+                    y,
+                    strength: prev.strength,
+                }),
+        );
         Ok(())
+    }
+
+    /// Returns the features for the most recently pushed frame.
+    ///
+    /// Empty until [`good_features_to_track`](Self::good_features_to_track) or
+    /// [`calculate_flow`](Self::calculate_flow) has been called after the last
+    /// [`push_frame`](Self::push_frame).
+    pub fn current_features(&self) -> &[Feature] {
+        &self.curr_frame.features
+    }
+
+    /// Returns the features for the frame prior to the most recently pushed one.
+    ///
+    /// Empty until a second [`push_frame`](Self::push_frame) has been called.
+    pub fn previous_features(&self) -> &[Feature] {
+        &self.prev_frame.features
     }
 
     // --- read-only accessors ---
@@ -354,65 +406,75 @@ mod tests {
 
         assert!(!buf.has_current_frame());
         assert!(!buf.has_previous_frame());
+        assert!(buf.current_features().is_empty());
+        assert!(buf.previous_features().is_empty());
 
-        let mut points: Vec<(f32, f32)> = Vec::new();
-        let mut tracked: Vec<(f32, f32)> = Vec::new();
-
-        // First push primes curr.
         buf.push_frame(&make_view(&frame_a, W, H)).unwrap();
         assert!(buf.has_current_frame());
-        assert!(!buf.has_previous_frame());
+        assert!(buf.current_features().is_empty(), "push clears current_features");
 
-        // Detect on curr (= frame_a).
-        buf.good_features_to_track(&mut points).unwrap();
-        assert!(!points.is_empty(), "checkerboard should yield features");
+        buf.good_features_to_track().unwrap();
+        let n = buf.current_features().len();
+        assert!(n > 0, "checkerboard yields features");
+        // Strength should be non-negative.
+        assert!(buf.current_features().iter().all(|f| f.strength >= 0.0));
 
-        // Second push rotates: prev=frame_a, curr=frame_b.
         buf.push_frame(&make_view(&frame_b, W, H)).unwrap();
         assert!(buf.has_previous_frame());
+        assert_eq!(
+            buf.previous_features().len(),
+            n,
+            "swap preserves features attached to old curr"
+        );
+        assert!(buf.current_features().is_empty(), "new curr starts empty");
 
-        // Track.
-        let n = points.len();
-        buf.calculate_flow(&points, &mut tracked).unwrap();
-        assert_eq!(tracked.len(), n, "tracked count matches feature count");
+        buf.calculate_flow().unwrap();
+        assert_eq!(buf.current_features().len(), n);
+
+        // Strength is preserved through tracking.
+        for (prev, curr) in buf
+            .previous_features()
+            .iter()
+            .zip(buf.current_features().iter())
+        {
+            assert_eq!(prev.strength, curr.strength);
+        }
+    }
+
+    #[test]
+    fn push_frame_clears_stale_curr_features() {
+        const W: u32 = 16;
+        const H: u32 = 16;
+        let frame = vec![0u8; (W * H) as usize];
+
+        let mut buf = OpticalFlowBuilder::new(W, H).build();
+        buf.push_frame(&make_view(&frame, W, H)).unwrap();
+        buf.push_frame(&make_view(&frame, W, H)).unwrap();
+        // After two pushes with no detect/track, both feature lists must be empty.
+        assert!(buf.current_features().is_empty());
+        assert!(buf.previous_features().is_empty());
     }
 
     #[test]
     fn good_features_errors_before_any_push() {
         let mut buf = OpticalFlowBuilder::new(16, 16).build();
-        let mut points = Vec::new();
         assert_eq!(
-            buf.good_features_to_track(&mut points),
+            buf.good_features_to_track(),
             Err(TrackError::NoCurrentFrame)
         );
-        assert!(!buf.has_current_frame());
     }
 
     #[test]
     fn calculate_flow_errors_before_two_pushes() {
         let mut buf = OpticalFlowBuilder::new(16, 16).build();
         let frame = vec![0u8; 16 * 16];
+        assert_eq!(buf.calculate_flow(), Err(TrackError::NoPreviousFrame));
 
-        // Zero pushes.
-        let features: Vec<(f32, f32)> = vec![(0.0, 0.0)];
-        let mut out = Vec::new();
-        assert_eq!(
-            buf.calculate_flow(&features, &mut out),
-            Err(TrackError::NoPreviousFrame)
-        );
-
-        // One push — still no prev.
         buf.push_frame(&make_view(&frame, 16, 16)).unwrap();
-        assert_eq!(
-            buf.calculate_flow(&features, &mut out),
-            Err(TrackError::NoPreviousFrame)
-        );
-        assert!(!buf.has_previous_frame());
+        assert_eq!(buf.calculate_flow(), Err(TrackError::NoPreviousFrame));
 
-        // Two pushes — now ready.
         buf.push_frame(&make_view(&frame, 16, 16)).unwrap();
-        assert!(buf.has_previous_frame());
-        assert!(buf.calculate_flow(&features, &mut out).is_ok());
+        assert!(buf.calculate_flow().is_ok());
     }
 
     #[test]
@@ -466,7 +528,10 @@ mod tests {
             color_hint: None,
         };
         let err = buf.push_frame(&view).unwrap_err();
-        assert_eq!(err, TrackError::Layout(LayoutError::UnsupportedWidthStride(2)));
+        assert_eq!(
+            err,
+            TrackError::Layout(LayoutError::UnsupportedWidthStride(2))
+        );
     }
 
     #[test]
@@ -514,7 +579,10 @@ mod tests {
         let err = buf.push_frame(&view).unwrap_err();
         assert_eq!(
             err,
-            TrackError::Layout(LayoutError::BufferTooSmall { required: 64, actual: 10 })
+            TrackError::Layout(LayoutError::BufferTooSmall {
+                required: 64,
+                actual: 10
+            })
         );
     }
 

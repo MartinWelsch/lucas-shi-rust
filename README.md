@@ -32,22 +32,17 @@ let mut buf = OpticalFlowBuilder::new(width, height)
     .feature_min_distance(5)
     .build();
 
-let mut points: Vec<(f32, f32)> = Vec::new();
-let mut tracked: Vec<(f32, f32)> = Vec::new();
-
 // Prime the pipeline with the first frame and detect features on it.
 buf.push_frame(&first_frame_view)?;
-buf.good_features_to_track(&mut points)?;
+buf.good_features_to_track()?;
 
 // Track those features through subsequent frames.
 for frame_view in frames {
     buf.push_frame(&frame_view)?;
-    buf.calculate_flow(&points, &mut tracked)?;
-    for &(x, y) in &tracked {
-        println!("tracked point at ({x}, {y})");
+    buf.calculate_flow()?;
+    for &feature in buf.current_features() {
+        // feature.x, feature.y, feature.strength
     }
-    // Swap so `points` holds the current-frame positions for the next iteration.
-    std::mem::swap(&mut points, &mut tracked);
 }
 ```
 
@@ -106,10 +101,10 @@ After the initial warm-up `OpticalFlowBuffer` performs zero heap allocations
 per frame. `push_frame` accepts any `&FlatSamples<B>` matching the configured
 resolution, so subrects of larger images and NV12 Y planes are zero-copy.
 
-The caller owns the feature-point buffers and passes them in. This allows full
-flexibility: filter, merge, or seed points between frames without any
-allocation on the buffer side.
+Feature buffers are owned by the pipeline and are accessible via
+`current_features()` and `previous_features()`. Each `Feature` carries its
+spatial position and its Shi-Tomasi strength through tracking.
 
-Re-detect features at any time by calling `good_features_to_track` after a
-`push_frame`. Re-seed with custom points by simply populating your `Vec<(f32, f32)>`
-before the next `calculate_flow` call.
+Re-detect features at any time by calling `good_features_to_track()` after a
+`push_frame`. The next `calculate_flow()` call will track whatever features
+are in the previous frame buffer.

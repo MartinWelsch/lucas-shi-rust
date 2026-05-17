@@ -89,35 +89,27 @@ fn buffer_path_is_steady_state_zero_alloc() {
 
     let mut buf = OpticalFlowBuilder::new(W, H).build();
 
-    let mut points: Vec<(f32, f32)> = Vec::new();
-    let mut tracked: Vec<(f32, f32)> = Vec::new();
-
     // Warm-up:
     //   1. push primes curr.
-    //   2. detect populates `points` to its steady-state size.
-    //   3. push rotates so prev=a, curr=b.
-    //   4. calculate_flow fills `tracked` to steady-state.
-    //   5. Additional push+flow cycles stabilize internal Vecs.
+    //   2. detect populates curr.features to its steady-state size.
+    //   3. push rotates so prev = a, curr = b.
+    //   4. calculate_flow fills curr.features.
+    //   5. Additional cycles stabilize internal Vecs.
     buf.push_frame(&make_view(&frame_a, W, H)).unwrap();
-    buf.good_features_to_track(&mut points).unwrap();
+    buf.good_features_to_track().unwrap();
     buf.push_frame(&make_view(&frame_b, W, H)).unwrap();
-    buf.calculate_flow(&points, &mut tracked).unwrap();
-    std::mem::swap(&mut points, &mut tracked);
+    buf.calculate_flow().unwrap();
     buf.push_frame(&make_view(&frame_a, W, H)).unwrap();
-    buf.calculate_flow(&points, &mut tracked).unwrap();
-    std::mem::swap(&mut points, &mut tracked);
+    buf.calculate_flow().unwrap();
     buf.push_frame(&make_view(&frame_b, W, H)).unwrap();
-    buf.calculate_flow(&points, &mut tracked).unwrap();
-    std::mem::swap(&mut points, &mut tracked);
+    buf.calculate_flow().unwrap();
 
     let n_alloc = measure(|| {
         for _ in 0..10 {
             buf.push_frame(&make_view(&frame_a, W, H)).unwrap();
-            buf.calculate_flow(&points, &mut tracked).unwrap();
-            std::mem::swap(&mut points, &mut tracked);
+            buf.calculate_flow().unwrap();
             buf.push_frame(&make_view(&frame_b, W, H)).unwrap();
-            buf.calculate_flow(&points, &mut tracked).unwrap();
-            std::mem::swap(&mut points, &mut tracked);
+            buf.calculate_flow().unwrap();
         }
     });
 
@@ -137,15 +129,13 @@ fn buffer_path_good_features_to_track_is_zero_alloc_after_warmup() {
 
     let mut buf = OpticalFlowBuilder::new(W, H).build();
     buf.push_frame(&view).unwrap();
-
-    let mut points: Vec<(f32, f32)> = Vec::new();
-    // Warm-up: the first detect may grow `points` to its steady size.
-    buf.good_features_to_track(&mut points).unwrap();
-    buf.good_features_to_track(&mut points).unwrap();
+    // Warm-up: the first detect may grow curr.features to its steady size.
+    buf.good_features_to_track().unwrap();
+    buf.good_features_to_track().unwrap();
 
     let n_alloc = measure(|| {
         for _ in 0..5 {
-            buf.good_features_to_track(&mut points).unwrap();
+            buf.good_features_to_track().unwrap();
         }
     });
 
