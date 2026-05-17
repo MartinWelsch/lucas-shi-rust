@@ -167,9 +167,14 @@ impl OpticalFlowBuffer {
         Ok(())
     }
 
-    /// Replace the tracked-point list with the provided values. Moves the
-    /// Vec contents into the buffer; the existing internal allocation is
-    /// reused when the new length fits.
+    /// Replace the tracked-point list with the provided values. The buffer
+    /// takes ownership of `points` and discards the previous list (including
+    /// its capacity). Cheap, but not zero-allocation if `points` was freshly
+    /// constructed — callers in tight loops who want to reuse the existing
+    /// capacity should mutate via [`points_mut`](Self::points_mut) instead.
+    ///
+    /// Does not touch the pyramids; the next `push_frame` will compute flow
+    /// for these points against the most recently pushed frame.
     pub fn reset(&mut self, points: Vec<(f32, f32)>) {
         self.points = points;
     }
