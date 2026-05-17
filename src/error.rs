@@ -41,3 +41,73 @@ mod tests {
         );
     }
 }
+
+/// Errors returned by [`OpticalFlowBuffer`] operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrackError {
+    /// The provided `FlatSamples` failed the same layout checks as the
+    /// `generic::*` entry points (channels, stride, buffer length).
+    Layout(LayoutError),
+
+    /// `image.layout.width` or `.height` did not match the buffer's
+    /// configured resolution.
+    DimensionMismatch { expected: (u32, u32), actual: (u32, u32) },
+
+    /// `reset_with_good_features_to_track` was called before any frame was
+    /// pushed, so there is nothing to detect features on.
+    NoPreviousFrame,
+}
+
+impl From<LayoutError> for TrackError {
+    fn from(value: LayoutError) -> Self {
+        TrackError::Layout(value)
+    }
+}
+
+impl std::fmt::Display for TrackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrackError::Layout(err) => write!(f, "layout error: {err}"),
+            TrackError::DimensionMismatch { expected, actual } => write!(
+                f,
+                "dimension mismatch: expected {:?}, got {:?}",
+                expected, actual
+            ),
+            TrackError::NoPreviousFrame =>
+                write!(f, "no previous frame pushed yet"),
+        }
+    }
+}
+
+impl std::error::Error for TrackError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TrackError::Layout(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod track_error_tests {
+    use super::*;
+
+    #[test]
+    fn track_error_wraps_layout_error_via_from() {
+        let layout = LayoutError::UnsupportedChannels(4);
+        let track: TrackError = layout.clone().into();
+        assert_eq!(track, TrackError::Layout(layout));
+    }
+
+    #[test]
+    fn track_error_display_renders() {
+        assert_eq!(
+            TrackError::DimensionMismatch { expected: (10, 20), actual: (30, 40) }.to_string(),
+            "dimension mismatch: expected (10, 20), got (30, 40)"
+        );
+        assert_eq!(
+            TrackError::NoPreviousFrame.to_string(),
+            "no previous frame pushed yet"
+        );
+    }
+}
