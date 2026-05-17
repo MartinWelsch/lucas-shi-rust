@@ -4,6 +4,81 @@ use std::cmp::Ordering;
 
 use crate::utils::{box_filter_3x3::box_filter_3x3_in_place, fast_gradients::compute_gradients_into};
 
+/// Reusable storage for Shi-Tomasi feature detection. Pre-allocates every
+/// per-call buffer at construction; `detect_into` reuses them.
+pub(crate) struct FeaturesBuffer {
+    gx: ImageBuffer<Luma<i16>, Vec<i16>>,
+    gy: ImageBuffer<Luma<i16>, Vec<i16>>,
+    ix_sq: ImageBuffer<Luma<i16>, Vec<i16>>,
+    iy_sq: ImageBuffer<Luma<i16>, Vec<i16>>,
+    ix_iy: ImageBuffer<Luma<i16>, Vec<i16>>,
+    features: Vec<(u32, u32, f32)>,
+    is_local_max: Vec<bool>,
+    grid: Vec<Option<(u32, u32)>>,
+    out: Vec<(u32, u32, f32)>,
+}
+
+impl FeaturesBuffer {
+    /// Pre-allocate every buffer using best-effort upper bounds derived from
+    /// the configured resolution and `min_distance`.
+    pub(crate) fn with_capacity(width: u32, height: u32, min_distance: u32) -> Self {
+        let pixels = (width as usize) * (height as usize);
+        let cell_size = min_distance.max(1);
+        let grid_width = width.div_ceil(cell_size);
+        let grid_height = height.div_ceil(cell_size);
+        let cells = (grid_width * grid_height) as usize;
+
+        Self {
+            gx: ImageBuffer::new(width, height),
+            gy: ImageBuffer::new(width, height),
+            ix_sq: ImageBuffer::new(width, height),
+            iy_sq: ImageBuffer::new(width, height),
+            ix_iy: ImageBuffer::new(width, height),
+            features: Vec::with_capacity(pixels),
+            is_local_max: vec![false; pixels],
+            grid: vec![None; cells],
+            out: Vec::with_capacity(pixels),
+        }
+    }
+
+    /// Detect Shi-Tomasi features on `image`, returning a slice of
+    /// `(x, y, min_eigenvalue)` triples filtered by quality and distance.
+    /// The returned slice borrows from `self.out`. No heap allocation when
+    /// the buffer was sized for the same resolution and min_distance.
+    pub(crate) fn detect_into(
+        &mut self,
+        image: &FlatSamples<&[u8]>,
+        quality_level: f32,
+        min_distance: u32,
+    ) -> &[(u32, u32, f32)] {
+        let width = image.layout.width;
+        let height = image.layout.height;
+
+        compute_gradients_into(image, &mut self.gx, &mut self.gy);
+        compute_gradient_products_into(&self.gx, &self.gy, &mut self.ix_sq, &mut self.iy_sq, &mut self.ix_iy);
+
+        box_filter_3x3_in_place(&mut self.ix_sq);
+        box_filter_3x3_in_place(&mut self.iy_sq);
+        box_filter_3x3_in_place(&mut self.ix_iy);
+
+        compute_min_eigenvalues_into(&self.ix_sq, &self.iy_sq, &self.ix_iy, &mut self.features);
+        non_maximum_suppression(&mut self.features, width, height, &mut self.is_local_max);
+        filter_by_quality(&mut self.features, quality_level);
+
+        self.features.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(Ordering::Equal));
+        filter_by_distance_into(
+            &self.features,
+            min_distance,
+            width,
+            height,
+            &mut self.grid,
+            &mut self.out,
+        );
+
+        &self.out
+    }
+}
+
 /// Finds good features points using the Shi-Tomasi algorithm
 ///
 /// # Arguments
@@ -18,43 +93,10 @@ pub fn good_features_to_track(
     quality_level: f32,
     min_distance: u32,
 ) -> Vec<(u32, u32, f32)> {
-    good_features_to_track_impl(&image.as_flat_samples(), quality_level, min_distance)
-}
-
-pub(crate) fn good_features_to_track_impl(
-    image: &FlatSamples<&[u8]>,
-    quality_level: f32,
-    min_distance: u32,
-) -> Vec<(u32, u32, f32)> {
-    let width = image.layout.width;
-    let height = image.layout.height;
-
-    let mut gx: ImageBuffer<Luma<i16>, Vec<i16>> = ImageBuffer::new(width, height);
-    let mut gy: ImageBuffer<Luma<i16>, Vec<i16>> = ImageBuffer::new(width, height);
-    compute_gradients_into(image, &mut gx, &mut gy);
-
-    let mut ix_sq: ImageBuffer<Luma<i16>, Vec<i16>> = ImageBuffer::new(width, height);
-    let mut iy_sq: ImageBuffer<Luma<i16>, Vec<i16>> = ImageBuffer::new(width, height);
-    let mut ix_iy: ImageBuffer<Luma<i16>, Vec<i16>> = ImageBuffer::new(width, height);
-    compute_gradient_products_into(&gx, &gy, &mut ix_sq, &mut iy_sq, &mut ix_iy);
-
-    box_filter_3x3_in_place(&mut ix_sq);
-    box_filter_3x3_in_place(&mut iy_sq);
-    box_filter_3x3_in_place(&mut ix_iy);
-
-    let mut features: Vec<(u32, u32, f32)> = Vec::new();
-    compute_min_eigenvalues_into(&ix_sq, &iy_sq, &ix_iy, &mut features);
-
-    let mut is_local_max: Vec<bool> = Vec::new();
-    non_maximum_suppression(&mut features, width, height, &mut is_local_max);
-    filter_by_quality(&mut features, quality_level);
-
-    features.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(Ordering::Equal));
-
-    let mut grid: Vec<Option<(u32, u32)>> = Vec::new();
-    let mut out: Vec<(u32, u32, f32)> = Vec::new();
-    filter_by_distance_into(&features, min_distance, width, height, &mut grid, &mut out);
-    out
+    let (w, h) = image.dimensions();
+    let mut buf = FeaturesBuffer::with_capacity(w, h, min_distance);
+    buf.detect_into(&image.as_flat_samples(), quality_level, min_distance)
+        .to_vec()
 }
 
 fn compute_gradient_products_into(
@@ -85,7 +127,6 @@ fn compute_min_eigenvalues_into(
     out: &mut Vec<(u32, u32, f32)>,
 ) {
     out.clear();
-    // Capacity is set by the caller (FeaturesBuffer::with_capacity in Task 6).
 
     for y in 0..a.height() {
         for x in 0..a.width() {

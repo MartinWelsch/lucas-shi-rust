@@ -10,7 +10,6 @@ use image::flat::FlatSamples;
 use image::GrayImage;
 
 use crate::LayoutError;
-use crate::features::good_features_to_track_impl;
 
 /// Build a Gaussian-style pyramid from any single-channel buffer.
 ///
@@ -44,11 +43,14 @@ pub fn good_features_to_track<B: AsRef<[u8]>>(
     min_distance: u32,
 ) -> Result<Vec<(u32, u32, f32)>, LayoutError> {
     validate(image)?;
-    Ok(good_features_to_track_impl(
-        &thin(image),
-        quality_level,
+    let mut buf = crate::features::FeaturesBuffer::with_capacity(
+        image.layout.width,
+        image.layout.height,
         min_distance,
-    ))
+    );
+    Ok(buf
+        .detect_into(&thin(image), quality_level, min_distance)
+        .to_vec())
 }
 
 fn validate<B: AsRef<[u8]>>(fs: &FlatSamples<B>) -> Result<(), LayoutError> {
