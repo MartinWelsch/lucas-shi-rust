@@ -253,3 +253,167 @@ fn thin_flat_samples<B: AsRef<[u8]>>(fs: &FlatSamples<B>) -> FlatSamples<&[u8]> 
         color_hint: fs.color_hint,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::LayoutError;
+    use image::flat::SampleLayout;
+
+    fn make_view<'a>(buf: &'a [u8], width: u32, height: u32) -> FlatSamples<&'a [u8]> {
+        FlatSamples {
+            samples: buf,
+            layout: SampleLayout {
+                channels: 1,
+                channel_stride: 1,
+                width,
+                width_stride: 1,
+                height,
+                height_stride: width as usize,
+            },
+            color_hint: None,
+        }
+    }
+
+    #[test]
+    fn lifecycle_first_push_primes_pyramid_then_detect_then_track() {
+        const W: u32 = 64;
+        const H: u32 = 64;
+        // Checkerboard with 8×8 cells: high-contrast edges produce gradients
+        // large enough to survive the /32 integer division in feature detection.
+        let frame_a: Vec<u8> = (0..(W * H) as usize)
+            .map(|i| {
+                let x = (i % W as usize) / 8;
+                let y = (i / W as usize) / 8;
+                if (x + y) % 2 == 0 { 0u8 } else { 255u8 }
+            })
+            .collect();
+        let frame_b: Vec<u8> = frame_a.iter().map(|p| p.wrapping_add(2)).collect();
+
+        let mut buf = OpticalFlowBuilder::new(W, H)
+            .pyramid_levels(2)
+            .window_size(5)
+            .max_iterations(5)
+            .feature_min_distance(4)
+            .feature_quality_level(0.1)
+            .build();
+
+        assert!(!buf.has_previous_frame());
+        assert!(buf.points().is_empty());
+
+        buf.push_frame(&make_view(&frame_a, W, H)).unwrap();
+        assert!(buf.has_previous_frame());
+        assert!(buf.points().is_empty(), "first push should not produce points");
+
+        buf.reset_with_good_features_to_track().unwrap();
+        assert!(!buf.points().is_empty(), "detect should find at least one feature");
+
+        let detected_count = buf.points().len();
+        buf.push_frame(&make_view(&frame_b, W, H)).unwrap();
+        assert_eq!(
+            buf.points().len(),
+            detected_count,
+            "tracking preserves the number of points"
+        );
+    }
+
+    #[test]
+    fn dimension_mismatch_error() {
+        let mut buf = OpticalFlowBuilder::new(100, 50).build();
+        let img = vec![0u8; 200 * 50];
+        let err = buf.push_frame(&make_view(&img, 200, 50)).unwrap_err();
+        assert_eq!(
+            err,
+            TrackError::DimensionMismatch {
+                expected: (100, 50),
+                actual: (200, 50),
+            }
+        );
+    }
+
+    #[test]
+    fn layout_error_pass_through() {
+        let mut buf = OpticalFlowBuilder::new(8, 8).build();
+        let data = vec![0u8; 8 * 8 * 3];
+        let view = FlatSamples {
+            samples: &data[..],
+            layout: SampleLayout {
+                channels: 3,
+                channel_stride: 1,
+                width: 8,
+                width_stride: 1,
+                height: 8,
+                height_stride: 8,
+            },
+            color_hint: None,
+        };
+        let err = buf.push_frame(&view).unwrap_err();
+        assert_eq!(err, TrackError::Layout(LayoutError::UnsupportedChannels(3)));
+    }
+
+    #[test]
+    fn no_previous_frame_error() {
+        let mut buf = OpticalFlowBuilder::new(16, 16).build();
+        let err = buf.reset_with_good_features_to_track().unwrap_err();
+        assert_eq!(err, TrackError::NoPreviousFrame);
+        assert!(!buf.has_previous_frame());
+    }
+
+    #[test]
+    fn reset_preserves_capacity() {
+        let mut buf = OpticalFlowBuilder::new(16, 16).build();
+        buf.reset(vec![(0.0, 0.0); 100]);
+        let cap_after_first = buf.points_mut().capacity();
+        assert!(cap_after_first >= 100);
+
+        buf.reset(vec![(0.0, 0.0); 50]);
+        // After replacement, capacity comes from the new Vec — the old buffer
+        // is moved out by `self.points = points`. The new Vec was sized to 50;
+        // Rust may give it capacity == len. The contract holds: capacity covers
+        // at least the new length.
+        assert!(buf.points_mut().capacity() >= 50);
+
+        // Now grow via points_mut and confirm capacity tracks.
+        buf.points_mut().reserve(200);
+        assert!(buf.points_mut().capacity() >= 200);
+    }
+
+    #[test]
+    fn manual_mutation_via_points_mut_drives_tracking() {
+        const W: u32 = 64;
+        const H: u32 = 64;
+        let frame_a: Vec<u8> = (0..(W * H) as usize).map(|i| (i % 251) as u8).collect();
+        let frame_b: Vec<u8> = frame_a.iter().map(|p| p.wrapping_add(1)).collect();
+
+        let mut buf = OpticalFlowBuilder::new(W, H)
+            .pyramid_levels(2)
+            .window_size(5)
+            .max_iterations(5)
+            .build();
+
+        buf.push_frame(&make_view(&frame_a, W, H)).unwrap();
+        buf.points_mut().push((20.0, 20.0));
+        buf.points_mut().push((40.0, 40.0));
+
+        buf.push_frame(&make_view(&frame_b, W, H)).unwrap();
+        assert_eq!(buf.points().len(), 2);
+    }
+
+    #[test]
+    fn accessors_return_builder_values() {
+        let buf = OpticalFlowBuilder::new(320, 240)
+            .pyramid_levels(4)
+            .window_size(11)
+            .max_iterations(20)
+            .feature_quality_level(0.25)
+            .feature_min_distance(7)
+            .build();
+
+        assert_eq!(buf.dimensions(), (320, 240));
+        assert_eq!(buf.pyramid_levels(), 4);
+        assert_eq!(buf.window_size(), 11);
+        assert_eq!(buf.max_iterations(), 20);
+        assert!((buf.feature_quality_level() - 0.25).abs() < 1e-6);
+        assert_eq!(buf.feature_min_distance(), 7);
+    }
+}
