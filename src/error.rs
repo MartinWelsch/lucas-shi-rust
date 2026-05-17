@@ -53,9 +53,13 @@ pub enum TrackError {
     /// configured resolution.
     DimensionMismatch { expected: (u32, u32), actual: (u32, u32) },
 
-    /// `reset_with_good_features_to_track` was called before any frame was
-    /// pushed, so there is nothing to detect features on.
+    /// `calculate_flow` was called before two frames had been pushed,
+    /// so there is no `prev` frame to track from.
     NoPreviousFrame,
+
+    /// `good_features_to_track` was called before any frame had been pushed,
+    /// so there is nothing to detect features on.
+    NoCurrentFrame,
 }
 
 impl From<LayoutError> for TrackError {
@@ -75,6 +79,8 @@ impl std::fmt::Display for TrackError {
             ),
             TrackError::NoPreviousFrame =>
                 write!(f, "no previous frame pushed yet"),
+            TrackError::NoCurrentFrame =>
+                write!(f, "no current frame pushed yet"),
         }
     }
 }
@@ -108,6 +114,10 @@ mod track_error_tests {
         assert_eq!(
             TrackError::NoPreviousFrame.to_string(),
             "no previous frame pushed yet"
+        );
+        assert_eq!(
+            TrackError::NoCurrentFrame.to_string(),
+            "no current frame pushed yet"
         );
     }
 }

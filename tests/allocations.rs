@@ -89,35 +89,47 @@ fn buffer_path_is_steady_state_zero_alloc() {
 
     let mut buf = OpticalFlowBuilder::new(W, H).build();
 
+    let mut points: Vec<(f32, f32)> = Vec::new();
+    let mut tracked: Vec<(f32, f32)> = Vec::new();
+
     // Warm-up:
-    //   1. first push primes prev_pyramid (no flow)
-    //   2. detect populates points to steady-state size
-    //   3. additional pushes run LK for the first time, which may grow
-    //      displacements / output buffers to the steady-state size
+    //   1. push primes curr.
+    //   2. detect populates `points` to its steady-state size.
+    //   3. push rotates so prev=a, curr=b.
+    //   4. calculate_flow fills `tracked` to steady-state.
+    //   5. Additional push+flow cycles stabilize internal Vecs.
     buf.push_frame(&make_view(&frame_a, W, H)).unwrap();
-    buf.reset_with_good_features_to_track().unwrap();
+    buf.good_features_to_track(&mut points).unwrap();
     buf.push_frame(&make_view(&frame_b, W, H)).unwrap();
+    buf.calculate_flow(&points, &mut tracked).unwrap();
+    std::mem::swap(&mut points, &mut tracked);
     buf.push_frame(&make_view(&frame_a, W, H)).unwrap();
+    buf.calculate_flow(&points, &mut tracked).unwrap();
+    std::mem::swap(&mut points, &mut tracked);
     buf.push_frame(&make_view(&frame_b, W, H)).unwrap();
+    buf.calculate_flow(&points, &mut tracked).unwrap();
+    std::mem::swap(&mut points, &mut tracked);
 
     let n_alloc = measure(|| {
         for _ in 0..10 {
             buf.push_frame(&make_view(&frame_a, W, H)).unwrap();
+            buf.calculate_flow(&points, &mut tracked).unwrap();
+            std::mem::swap(&mut points, &mut tracked);
             buf.push_frame(&make_view(&frame_b, W, H)).unwrap();
+            buf.calculate_flow(&points, &mut tracked).unwrap();
+            std::mem::swap(&mut points, &mut tracked);
         }
     });
 
     assert_eq!(
         n_alloc, 0,
-        "OpticalFlowBuffer::push_frame allocated {n_alloc} times in 20 frames \
-         after warm-up; expected 0. Common causes: hidden .to_vec() or .collect() \
-         in the hot path; Vec::resize past pre-allocated capacity; new \
-         intermediate Vec declared inside a per-frame method; panic codepath."
+        "OpticalFlowBuffer steady-state allocated {n_alloc} times in 20 frames \
+         after warm-up; expected 0."
     );
 }
 
 #[test]
-fn buffer_path_reset_with_good_features_is_zero_alloc_after_warmup() {
+fn buffer_path_good_features_to_track_is_zero_alloc_after_warmup() {
     const W: u32 = 256;
     const H: u32 = 256;
     let frame = checkerboard(W, H, 8);
@@ -125,19 +137,21 @@ fn buffer_path_reset_with_good_features_is_zero_alloc_after_warmup() {
 
     let mut buf = OpticalFlowBuilder::new(W, H).build();
     buf.push_frame(&view).unwrap();
-    // Warm-up: the first detect may grow `self.points` to its steady size.
-    buf.reset_with_good_features_to_track().unwrap();
-    buf.reset_with_good_features_to_track().unwrap();
+
+    let mut points: Vec<(f32, f32)> = Vec::new();
+    // Warm-up: the first detect may grow `points` to its steady size.
+    buf.good_features_to_track(&mut points).unwrap();
+    buf.good_features_to_track(&mut points).unwrap();
 
     let n_alloc = measure(|| {
         for _ in 0..5 {
-            buf.reset_with_good_features_to_track().unwrap();
+            buf.good_features_to_track(&mut points).unwrap();
         }
     });
 
     assert_eq!(
         n_alloc, 0,
-        "reset_with_good_features_to_track allocated {n_alloc} times in 5 calls \
+        "good_features_to_track allocated {n_alloc} times in 5 calls \
          after warm-up; expected 0."
     );
 }
