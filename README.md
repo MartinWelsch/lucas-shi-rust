@@ -84,3 +84,45 @@ The `generic::*` functions validate the layout once at entry and return
 `Result<_, LayoutError>`. The four error variants — `UnsupportedChannels`,
 `UnsupportedWidthStride`, `OverlappingRows`, `BufferTooSmall` — cover only conditions that
 would cause wrong output or out-of-bounds reads.
+
+## Real-time tracking — `OpticalFlowBuffer`
+
+For per-frame tracking loops, build an `OpticalFlowBuffer` once and call
+`push_frame` for each new frame. After warm-up the library performs zero
+heap allocations per frame.
+
+```rust
+use optical_flow_lk::OpticalFlowBuilder;
+
+let mut buf = OpticalFlowBuilder::new(width, height)
+    .pyramid_levels(3)
+    .window_size(21)
+    .max_iterations(30)
+    .feature_quality_level(0.4)
+    .feature_min_distance(10)
+    .build();
+
+// Prime the pipeline with the first frame and seed the points.
+buf.push_frame(&first_frame_view)?;
+buf.reset_with_good_features_to_track()?;
+
+for frame_view in frames {
+    buf.push_frame(&frame_view)?;
+    // buf.points() now holds the updated positions.
+    for &(x, y) in buf.points() {
+        // …
+    }
+}
+```
+
+`push_frame` accepts any `&FlatSamples<B>` matching the configured resolution,
+so subrects of larger images and NV12 Y planes are zero-copy.
+
+`buf.points_mut()` allows direct manipulation of the tracked list — push, pop,
+or remove individual points without going through `reset`.
+
+Manual reset (custom seed):
+
+```rust
+buf.reset(vec![(10.0, 20.0), (200.0, 50.0)]);
+```
