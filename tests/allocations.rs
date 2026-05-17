@@ -1,29 +1,35 @@
 //! Allocation regression tests for the v0.4.0 buffer API.
 //!
-//! Run with:
-//!   cargo test --test allocations -- --test-threads=1
-//!
-//! The custom global allocator counts every alloc/dealloc; multi-threaded
-//! execution would race the counters.
+//! The custom global allocator counts every alloc on the calling thread via
+//! a thread-local counter, so tests are safe to run in parallel under any
+//! `--test-threads` setting.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
+use std::sync::Mutex;
 
 use image::flat::{FlatSamples, SampleLayout};
 use optical_flow_lk::{OpticalFlowBuilder, generic};
 
 struct CountingAllocator;
 
-static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
-static DEALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    // Number of allocations on this thread while MEASURING is true.
+    static THREAD_ALLOC_COUNT: Cell<usize> = const { Cell::new(0) };
+    // Whether this thread is currently inside a `measure` call.
+    static MEASURING: Cell<bool> = const { Cell::new(false) };
+}
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+        MEASURING.with(|m| {
+            if m.get() {
+                THREAD_ALLOC_COUNT.with(|c| c.set(c.get() + 1));
+            }
+        });
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        DEALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
         unsafe { System.dealloc(ptr, layout) }
     }
 }
@@ -31,14 +37,18 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static A: CountingAllocator = CountingAllocator;
 
-fn allocs() -> usize {
-    ALLOC_COUNT.load(Ordering::Relaxed)
-}
+// Serializes test measurements so the counting allocator's atomic counters
+// have an uncontended measurement window, regardless of how the test runner
+// schedules tests.
+static MEASUREMENT_LOCK: Mutex<()> = Mutex::new(());
 
 fn measure<F: FnOnce()>(f: F) -> usize {
-    let before = allocs();
+    let _guard = MEASUREMENT_LOCK.lock().expect("measurement lock poisoned");
+    THREAD_ALLOC_COUNT.with(|c| c.set(0));
+    MEASURING.with(|m| m.set(true));
     f();
-    allocs() - before
+    MEASURING.with(|m| m.set(false));
+    THREAD_ALLOC_COUNT.with(|c| c.get())
 }
 
 fn make_view<'a>(buf: &'a [u8], width: u32, height: u32) -> FlatSamples<&'a [u8]> {
