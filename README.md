@@ -36,3 +36,51 @@ let prev_points: Vec<(f32, f32)> = points.iter().map(|&x| (x.0 as f32, x.1 as f3
 
 let next_points = calc_optical_flow(&prev_frame_pyr, &next_frame_pyr, &prev_points, 21, 30);
 ```
+
+## Zero-copy input — subrect or NV12 Y plane
+
+Use `optical_flow_lk::generic::*` to pass a subrect of a larger image or the Y plane of an
+NV12 buffer without copying. These functions accept `image::flat::FlatSamples<B>`, which
+carries a row stride and borrows its data; the existing top-level `build_pyramid` /
+`good_features_to_track` (taking `&GrayImage`) are unchanged.
+
+### Subrect of a larger `GrayImage`
+
+```rust
+use optical_flow_lk::{generic, FlatSamples, SampleLayout};
+
+let stride = big.width() as usize;
+let off = oy as usize * stride + ox as usize;
+let view = FlatSamples {
+    samples: &big.as_raw()[off..],
+    layout: SampleLayout {
+        channels: 1, channel_stride: 1,
+        width: w, width_stride: 1,
+        height: h, height_stride: stride,
+    },
+    color_hint: None,
+};
+let pyramid = generic::build_pyramid(&view, 4)?;
+```
+
+### NV12 Y plane (full or subrect)
+
+```rust
+use optical_flow_lk::{generic, FlatSamples, SampleLayout};
+
+let view = FlatSamples {
+    samples: &nv12_buffer[..],
+    layout: SampleLayout {
+        channels: 1, channel_stride: 1,
+        width, width_stride: 1,
+        height, height_stride: y_stride,    // may exceed width for padded NV12
+    },
+    color_hint: None,
+};
+let pyramid = generic::build_pyramid(&view, 4)?;
+```
+
+The `generic::*` functions validate the layout once at entry and return
+`Result<_, LayoutError>`. The four error variants — `UnsupportedChannels`,
+`UnsupportedWidthStride`, `OverlappingRows`, `BufferTooSmall` — cover only conditions that
+would cause wrong output or out-of-bounds reads.
