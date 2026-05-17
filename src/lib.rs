@@ -7,12 +7,14 @@
 //!
 //! Designed to be compatible with WebAssembly (Wasm).
 
+mod error;
 mod features;
 mod lk;
 mod pyramid;
 mod utils;
 
 // Re-export main functionality
+pub use error::LayoutError;
 pub use features::good_features_to_track;
 pub use lk::calc_optical_flow;
 pub use pyramid::build_pyramid;
