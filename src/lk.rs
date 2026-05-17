@@ -1,8 +1,164 @@
 use image::{GrayImage, ImageBuffer, Luma};
 
-use crate::utils::fast_gradients::compute_gradients;
+use crate::utils::fast_gradients::compute_gradients_into;
 
-/// Compute optical flow using Lucas-Kanade method
+/// Reusable storage for the Lucas-Kanade tracking pipeline. Pre-allocates
+/// every per-frame buffer at construction; `calc_into` reuses them.
+pub(crate) struct LkBuffer {
+    grad_x: Vec<ImageBuffer<Luma<i16>, Vec<i16>>>,
+    grad_y: Vec<ImageBuffer<Luma<i16>, Vec<i16>>>,
+    prev_patch: Vec<f32>,
+    ix_patch: Vec<f32>,
+    iy_patch: Vec<f32>,
+    displacements: Vec<(f32, f32)>,
+    offsets: Vec<(f32, f32)>,
+}
+
+impl LkBuffer {
+    /// Pre-allocate gradient buffers for `levels` pyramid steps (level 0 at
+    /// `(width, height)`, level 1 at `(W/2, H/2)`, …) and patch buffers sized
+    /// to `window_size * window_size`. Panics if `window_size` is even.
+    pub(crate) fn with_capacity(
+        width: u32,
+        height: u32,
+        levels: usize,
+        window_size: usize,
+    ) -> Self {
+        assert!(window_size % 2 == 1, "Window size must be odd");
+        let mut grad_x = Vec::with_capacity(levels);
+        let mut grad_y = Vec::with_capacity(levels);
+        let mut w = width;
+        let mut h = height;
+        for level in 0..levels {
+            grad_x.push(ImageBuffer::new(w, h));
+            grad_y.push(ImageBuffer::new(w, h));
+            if level + 1 < levels {
+                if w < 2 || h < 2 {
+                    break;
+                }
+                w /= 2;
+                h /= 2;
+            }
+        }
+        let n_pixels = window_size * window_size;
+        let radius = window_size / 2;
+        Self {
+            grad_x,
+            grad_y,
+            prev_patch: vec![0.0; n_pixels],
+            ix_patch: vec![0.0; n_pixels],
+            iy_patch: vec![0.0; n_pixels],
+            displacements: Vec::new(),
+            offsets: build_window_offsets(radius),
+        }
+    }
+
+    /// Compute flow from `prev_pyramid` to `curr_pyramid` for the points in
+    /// `points`, writing the updated positions back in place. No heap
+    /// allocation when the buffer was sized for the same parameters.
+    pub(crate) fn calc_into(
+        &mut self,
+        prev_pyramid: &[GrayImage],
+        curr_pyramid: &[GrayImage],
+        points: &mut Vec<(f32, f32)>,
+        window_size: usize,
+        max_iterations: usize,
+    ) {
+        assert_eq!(prev_pyramid.len(), curr_pyramid.len());
+        assert!(window_size % 2 == 1, "Window size must be odd");
+        debug_assert_eq!(self.prev_patch.len(), window_size * window_size);
+
+        let n_levels = prev_pyramid.len();
+        let radius = window_size / 2;
+        let epsilon = 1e-3;
+        let det_epsilon = 1e-6;
+
+        self.displacements.clear();
+        self.displacements.resize(points.len(), (0.0, 0.0));
+
+        for level in (0..n_levels).rev() {
+            let scale = 2f32.powi(level as i32);
+            let prev_img = &prev_pyramid[level];
+            let curr_img = &curr_pyramid[level];
+
+            compute_gradients_into(
+                &prev_img.as_flat_samples(),
+                &mut self.grad_x[level],
+                &mut self.grad_y[level],
+            );
+
+            for ((prev_x, prev_y), disp) in points.iter().zip(self.displacements.iter_mut()) {
+                let x = *prev_x / scale;
+                let y = *prev_y / scale;
+                let mut dx = disp.0 / scale;
+                let mut dy = disp.1 / scale;
+
+                if !in_bounds(prev_img, x, y, radius) {
+                    continue;
+                }
+
+                let mut gxx = 0.0f32;
+                let mut gxy = 0.0f32;
+                let mut gyy = 0.0f32;
+
+                for (idx, (ox, oy)) in self.offsets.iter().enumerate() {
+                    let sample_x = x + ox;
+                    let sample_y = y + oy;
+                    let ix = interpolate_alt(&self.grad_x[level], sample_x, sample_y) / 32.0;
+                    let iy = interpolate_alt(&self.grad_y[level], sample_x, sample_y) / 32.0;
+
+                    self.prev_patch[idx] = interpolate(prev_img, sample_x, sample_y);
+                    self.ix_patch[idx] = ix;
+                    self.iy_patch[idx] = iy;
+                    gxx += ix * ix;
+                    gxy += ix * iy;
+                    gyy += iy * iy;
+                }
+
+                let Some((inv_h00, inv_h01, inv_h11)) = invert_2x2(gxx, gxy, gyy, det_epsilon) else {
+                    continue;
+                };
+
+                for _ in 0..max_iterations {
+                    let curr_x = x + dx;
+                    let curr_y = y + dy;
+
+                    if !in_bounds(curr_img, curr_x, curr_y, radius) {
+                        break;
+                    }
+
+                    let mut bx = 0.0f32;
+                    let mut by = 0.0f32;
+
+                    for (idx, (ox, oy)) in self.offsets.iter().enumerate() {
+                        let curr = interpolate(curr_img, curr_x + ox, curr_y + oy);
+                        let error = self.prev_patch[idx] - curr;
+                        bx += self.ix_patch[idx] * error;
+                        by += self.iy_patch[idx] * error;
+                    }
+
+                    let ddx = inv_h00 * bx + inv_h01 * by;
+                    let ddy = inv_h01 * bx + inv_h11 * by;
+                    dx += ddx;
+                    dy += ddy;
+
+                    if ddx.abs() < epsilon && ddy.abs() < epsilon {
+                        break;
+                    }
+                }
+
+                *disp = (dx * scale, dy * scale);
+            }
+        }
+
+        for (pt, disp) in points.iter_mut().zip(self.displacements.iter()) {
+            pt.0 += disp.0;
+            pt.1 += disp.1;
+        }
+    }
+}
+
+/// Compute optical flow using Lucas-Kanade method.
 ///
 /// # Arguments
 /// * `prev_pyramid` - Previous frame (pyramid of grayscale)
@@ -12,7 +168,7 @@ use crate::utils::fast_gradients::compute_gradients;
 /// * `max_iterations` - Max iterations for correct points on each layer
 ///
 /// # Returns
-/// Vector of points on next frame
+/// Vector of points on next frame.
 pub fn calc_optical_flow(
     prev_pyramid: &[GrayImage],
     curr_pyramid: &[GrayImage],
@@ -20,116 +176,18 @@ pub fn calc_optical_flow(
     window_size: usize,
     max_iterations: usize,
 ) -> Vec<(f32, f32)> {
-    assert_eq!(prev_pyramid.len(), curr_pyramid.len());
-    assert!(window_size % 2 == 1, "Window size must be odd");
-
-    let n_levels = prev_pyramid.len();
-    let radius = window_size / 2;
-    let n_pixels = window_size * window_size;
-    let epsilon = 1e-3;
-    let det_epsilon = 1e-6;
-    let offsets = build_window_offsets(radius);
-
-    // Initialize displacements to zero
-    let mut displacements: Vec<(f32, f32)> = prev_points.iter().map(|_| (0.0, 0.0)).collect();
-
-    // Process levels from top (coarse) to bottom (fine)
-    for level in (0..n_levels).rev() {
-        let scale = 2f32.powi(level as i32);
-
-        // Get the images for the current level
-        let prev_img = &prev_pyramid[level];
-        let curr_img = &curr_pyramid[level];
-
-        // Compute gradients for the previous image
-        // let grad_x = horizontal_scharr(prev_img);
-        // let grad_y = vertical_scharr(prev_img);
-        // console_log!("{}", performance.now()-now);
-        let (grad_x, grad_y) = compute_gradients(&prev_img.as_flat_samples());
-
-        let mut prev_patch = vec![0.0f32; n_pixels];
-        let mut ix_patch = vec![0.0f32; n_pixels];
-        let mut iy_patch = vec![0.0f32; n_pixels];
-
-        // Process each point
-        for ((prev_x, prev_y), disp) in prev_points.iter().zip(displacements.iter_mut()) {
-            // Scale the original point for the current level
-            let x = *prev_x / scale;
-            let y = *prev_y / scale;
-
-            // Add the current displacement, scaled for this level
-            let mut dx = disp.0 / scale;
-            let mut dy = disp.1 / scale;
-
-            // Skip points outside image bounds
-            if !in_bounds(prev_img, x, y, radius) {
-                continue;
-            }
-
-            let mut gxx = 0.0f32;
-            let mut gxy = 0.0f32;
-            let mut gyy = 0.0f32;
-
-            for (idx, (ox, oy)) in offsets.iter().enumerate() {
-                let sample_x = x + ox;
-                let sample_y = y + oy;
-                let ix = interpolate_alt(&grad_x, sample_x, sample_y) / 32.0;
-                let iy = interpolate_alt(&grad_y, sample_x, sample_y) / 32.0;
-
-                prev_patch[idx] = interpolate(prev_img, sample_x, sample_y);
-                ix_patch[idx] = ix;
-                iy_patch[idx] = iy;
-                gxx += ix * ix;
-                gxy += ix * iy;
-                gyy += iy * iy;
-            }
-
-            let Some((inv_h00, inv_h01, inv_h11)) = invert_2x2(gxx, gxy, gyy, det_epsilon) else {
-                continue;
-            };
-
-            // Refine the displacement at the current level
-            for _ in 0..max_iterations {
-                // Compute the current position in the target image
-                let curr_x = x + dx;
-                let curr_y = y + dy;
-
-                // Check bounds in the target image
-                if !in_bounds(curr_img, curr_x, curr_y, radius) {
-                    break;
-                }
-
-                let mut bx = 0.0f32;
-                let mut by = 0.0f32;
-
-                for (idx, (ox, oy)) in offsets.iter().enumerate() {
-                    let curr = interpolate(curr_img, curr_x + ox, curr_y + oy);
-                    let error = prev_patch[idx] - curr;
-                    bx += ix_patch[idx] * error;
-                    by += iy_patch[idx] * error;
-                }
-
-                let ddx = inv_h00 * bx + inv_h01 * by;
-                let ddy = inv_h01 * bx + inv_h11 * by;
-                dx += ddx;
-                dy += ddy;
-
-                if ddx.abs() < epsilon && ddy.abs() < epsilon {
-                    break;
-                }
-            }
-
-            // Update the total displacement with the current level scale
-            *disp = (dx * scale, dy * scale);
-        }
-    }
-
-    // Return the final positions
-    prev_points
-        .iter()
-        .zip(displacements.iter())
-        .map(|((x, y), (dx, dy))| (x + dx, y + dy))
-        .collect()
+    let (w, h) = prev_pyramid[0].dimensions();
+    let levels = prev_pyramid.len();
+    let mut buf = LkBuffer::with_capacity(w, h, levels, window_size);
+    let mut points = prev_points.to_vec();
+    buf.calc_into(
+        prev_pyramid,
+        curr_pyramid,
+        &mut points,
+        window_size,
+        max_iterations,
+    );
+    points
 }
 
 fn build_window_offsets(radius: usize) -> Vec<(f32, f32)> {
@@ -154,13 +212,13 @@ fn invert_2x2(a00: f32, a01: f32, a11: f32, det_epsilon: f32) -> Option<(f32, f3
     Some((a11 * inv_det, -a01 * inv_det, a00 * inv_det))
 }
 
-/// Checks that the window stays within image bounds
+/// Checks that the window stays within image bounds.
 fn in_bounds(img: &GrayImage, x: f32, y: f32, radius: usize) -> bool {
     let (w, h) = (img.width() as f32, img.height() as f32);
     x >= radius as f32 && x < w - radius as f32 && y >= radius as f32 && y < h - radius as f32
 }
 
-/// Bilinear interpolation of the pixel value
+/// Bilinear interpolation of the pixel value.
 fn interpolate(img: &GrayImage, x: f32, y: f32) -> f32 {
     let x0 = x.floor() as i32;
     let y0 = y.floor() as i32;
