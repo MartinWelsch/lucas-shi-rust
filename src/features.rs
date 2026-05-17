@@ -1,7 +1,8 @@
-use image::{flat::FlatSamples, GrayImage, ImageBuffer, Luma};
+use image::flat::FlatSamples;
+use image::{GrayImage, ImageBuffer, Luma};
 use std::cmp::Ordering;
 
-use crate::utils::{box_filter_3x3::box_filter_3x3_in_place, fast_gradients::compute_gradients};
+use crate::utils::{box_filter_3x3::box_filter_3x3_in_place, fast_gradients::compute_gradients_into};
 
 /// Finds good features points using the Shi-Tomasi algorithm
 ///
@@ -9,7 +10,6 @@ use crate::utils::{box_filter_3x3::box_filter_3x3_in_place, fast_gradients::comp
 /// * `image` - Target image (grayscale)
 /// * `quality_level` - Quality level. 0.4 is a good value
 /// * `min_distance` - Filter points by distance between
-///
 ///
 /// # Returns
 /// Vector of features with eigenvalue. Points sorted in descending order of quality
@@ -26,46 +26,47 @@ pub(crate) fn good_features_to_track_impl(
     quality_level: f32,
     min_distance: u32,
 ) -> Vec<(u32, u32, f32)> {
-    // Compute gradients
-    let (gx, gy) = compute_gradients(image);
+    let width = image.layout.width;
+    let height = image.layout.height;
 
-    // Compute squared gradients and their product
-    let (mut ix_sq, mut iy_sq, mut ix_iy) = compute_gradient_products(&gx, &gy);
+    let mut gx: ImageBuffer<Luma<i16>, Vec<i16>> = ImageBuffer::new(width, height);
+    let mut gy: ImageBuffer<Luma<i16>, Vec<i16>> = ImageBuffer::new(width, height);
+    compute_gradients_into(image, &mut gx, &mut gy);
 
-    // Smooth with 3x3 filters
+    let mut ix_sq: ImageBuffer<Luma<i16>, Vec<i16>> = ImageBuffer::new(width, height);
+    let mut iy_sq: ImageBuffer<Luma<i16>, Vec<i16>> = ImageBuffer::new(width, height);
+    let mut ix_iy: ImageBuffer<Luma<i16>, Vec<i16>> = ImageBuffer::new(width, height);
+    compute_gradient_products_into(&gx, &gy, &mut ix_sq, &mut iy_sq, &mut ix_iy);
+
     box_filter_3x3_in_place(&mut ix_sq);
     box_filter_3x3_in_place(&mut iy_sq);
     box_filter_3x3_in_place(&mut ix_iy);
 
-    // Compute minimum eigenvalues
-    let mut features = compute_min_eigenvalues(&ix_sq, &iy_sq, &ix_iy);
+    let mut features: Vec<(u32, u32, f32)> = Vec::new();
+    compute_min_eigenvalues_into(&ix_sq, &iy_sq, &ix_iy, &mut features);
 
-    // Non-maximum suppression
-    non_maximum_suppression(&mut features, gx.width(), gx.height());
-
-    // Filter by quality
+    let mut is_local_max: Vec<bool> = Vec::new();
+    non_maximum_suppression(&mut features, width, height, &mut is_local_max);
     filter_by_quality(&mut features, quality_level);
 
-    // Sort by descending quality
     features.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(Ordering::Equal));
 
-    // Filter by distance
-    filter_by_distance(&features, min_distance, gx.width(), gx.height())
+    let mut grid: Vec<Option<(u32, u32)>> = Vec::new();
+    let mut out: Vec<(u32, u32, f32)> = Vec::new();
+    filter_by_distance_into(&features, min_distance, width, height, &mut grid, &mut out);
+    out
 }
 
-type GradientProduct = (
-    ImageBuffer<Luma<i16>, Vec<i16>>,
-    ImageBuffer<Luma<i16>, Vec<i16>>,
-    ImageBuffer<Luma<i16>, Vec<i16>>,
-);
-
-fn compute_gradient_products(
+fn compute_gradient_products_into(
     gx: &ImageBuffer<Luma<i16>, Vec<i16>>,
     gy: &ImageBuffer<Luma<i16>, Vec<i16>>,
-) -> GradientProduct {
-    let mut ix_sq: ImageBuffer<Luma<i16>, Vec<i16>> = ImageBuffer::new(gx.width(), gx.height());
-    let mut iy_sq: ImageBuffer<Luma<i16>, Vec<i16>> = ImageBuffer::new(gx.width(), gx.height());
-    let mut ix_iy: ImageBuffer<Luma<i16>, Vec<i16>> = ImageBuffer::new(gx.width(), gx.height());
+    ix_sq: &mut ImageBuffer<Luma<i16>, Vec<i16>>,
+    iy_sq: &mut ImageBuffer<Luma<i16>, Vec<i16>>,
+    ix_iy: &mut ImageBuffer<Luma<i16>, Vec<i16>>,
+) {
+    debug_assert_eq!(gx.dimensions(), ix_sq.dimensions());
+    debug_assert_eq!(gx.dimensions(), iy_sq.dimensions());
+    debug_assert_eq!(gx.dimensions(), ix_iy.dimensions());
 
     for ((x, y, gx_val), gy_val) in gx.enumerate_pixels().zip(gy.pixels()) {
         let ix = gx_val[0];
@@ -75,16 +76,16 @@ fn compute_gradient_products(
         iy_sq.put_pixel(x, y, Luma([(iy / 32 * (iy / 32))]));
         ix_iy.put_pixel(x, y, Luma([(ix / 32 * (iy / 32))]));
     }
-
-    (ix_sq, iy_sq, ix_iy)
 }
 
-fn compute_min_eigenvalues(
+fn compute_min_eigenvalues_into(
     a: &ImageBuffer<Luma<i16>, Vec<i16>>,
     b: &ImageBuffer<Luma<i16>, Vec<i16>>,
     c: &ImageBuffer<Luma<i16>, Vec<i16>>,
-) -> Vec<(u32, u32, f32)> {
-    let mut features = Vec::with_capacity((a.width() * a.height()) as usize);
+    out: &mut Vec<(u32, u32, f32)>,
+) {
+    out.clear();
+    // Capacity is set by the caller (FeaturesBuffer::with_capacity in Task 6).
 
     for y in 0..a.height() {
         for x in 0..a.width() {
@@ -96,15 +97,19 @@ fn compute_min_eigenvalues(
             let discriminant = (a_val - b_val).pow(2) + 4 * c_val.pow(2);
             let min_eigen = (((trace - discriminant) as f32).sqrt()) / 2.0;
 
-            features.push((x, y, min_eigen));
+            out.push((x, y, min_eigen));
         }
     }
-
-    features
 }
 
-fn non_maximum_suppression(features: &mut Vec<(u32, u32, f32)>, width: u32, height: u32) {
-    let mut is_local_max = vec![false; features.len()];
+fn non_maximum_suppression(
+    features: &mut Vec<(u32, u32, f32)>,
+    width: u32,
+    height: u32,
+    is_local_max: &mut Vec<bool>,
+) {
+    is_local_max.clear();
+    is_local_max.resize(features.len(), false);
 
     for y in 1..height - 1 {
         for x in 1..width - 1 {
@@ -112,8 +117,8 @@ fn non_maximum_suppression(features: &mut Vec<(u32, u32, f32)>, width: u32, heig
             let current = features[idx].2;
 
             let mut is_max = true;
-            for dy in -1..=1 {
-                for dx in -1..=1 {
+            for dy in -1..=1i32 {
+                for dx in -1..=1i32 {
                     if dx == 0 && dy == 0 {
                         continue;
                     }
@@ -136,10 +141,16 @@ fn non_maximum_suppression(features: &mut Vec<(u32, u32, f32)>, width: u32, heig
         }
     }
 
-    features.retain(|(x, y, _)| {
+    let mut write = 0;
+    for read in 0..features.len() {
+        let (x, y, _) = features[read];
         let idx = (y * width + x) as usize;
-        is_local_max[idx]
-    });
+        if is_local_max[idx] {
+            features.swap(write, read);
+            write += 1;
+        }
+    }
+    features.truncate(write);
 }
 
 fn filter_by_quality(features: &mut Vec<(u32, u32, f32)>, quality_level: f32) {
@@ -151,17 +162,22 @@ fn filter_by_quality(features: &mut Vec<(u32, u32, f32)>, quality_level: f32) {
     features.retain(|&(_, _, q)| q >= threshold);
 }
 
-fn filter_by_distance(
+fn filter_by_distance_into(
     features: &[(u32, u32, f32)],
     min_distance: u32,
     width: u32,
     height: u32,
-) -> Vec<(u32, u32, f32)> {
+    grid: &mut Vec<Option<(u32, u32)>>,
+    out: &mut Vec<(u32, u32, f32)>,
+) {
     let cell_size = min_distance;
     let grid_width = width.div_ceil(cell_size);
     let grid_height = height.div_ceil(cell_size);
-    let mut grid = vec![vec![None; grid_height as usize]; grid_width as usize];
-    let mut result = Vec::new();
+    let cells = (grid_width * grid_height) as usize;
+
+    grid.clear();
+    grid.resize(cells, None);
+    out.clear();
 
     let min_dist_sq = (min_distance * min_distance) as i32;
 
@@ -170,8 +186,8 @@ fn filter_by_distance(
         let cell_y = y / cell_size;
         let mut too_close = false;
 
-        for dx in -1..=1 {
-            for dy in -1..=1 {
+        for dx in -1..=1i32 {
+            for dy in -1..=1i32 {
                 let check_x = cell_x as i32 + dx;
                 let check_y = cell_y as i32 + dy;
 
@@ -183,7 +199,8 @@ fn filter_by_distance(
                     continue;
                 }
 
-                if let Some((px, py)) = grid[check_x as usize][check_y as usize] {
+                let cell_idx = (check_y as u32 * grid_width + check_x as u32) as usize;
+                if let Some((px, py)) = grid[cell_idx] {
                     let dist_sq: i32 =
                         (x as i32 - px as i32).pow(2) + (y as i32 - py as i32).pow(2);
                     if dist_sq < min_dist_sq {
@@ -198,10 +215,9 @@ fn filter_by_distance(
         }
 
         if !too_close {
-            grid[cell_x as usize][cell_y as usize] = Some((x, y));
-            result.push((x, y, q));
+            let cell_idx = (cell_y * grid_width + cell_x) as usize;
+            grid[cell_idx] = Some((x, y));
+            out.push((x, y, q));
         }
     }
-
-    result
 }
