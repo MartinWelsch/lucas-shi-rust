@@ -1,4 +1,4 @@
-use image::{flat::FlatSamples, GrayImage, ImageBuffer, Luma};
+use image::{flat::FlatSamples, ImageBuffer, Luma};
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 #[cfg(target_arch = "x86")]
@@ -305,6 +305,7 @@ unsafe fn load_u8x16_as_i16x8x2(ptr: *const u8) -> (int16x8_t, int16x8_t) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::GrayImage;
 
     fn make_test_image(width: u32, height: u32) -> GrayImage {
         let mut img = GrayImage::new(width, height);
