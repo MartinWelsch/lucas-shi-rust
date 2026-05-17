@@ -16,54 +16,89 @@ type GradientProduct = (
 
 /// Computes signed Scharr gradients.
 ///
+/// Allocates fresh `ImageBuffer<Luma<i16>, Vec<i16>>` output buffers.
+/// For an allocation-free variant, see [`compute_gradients_into`].
+///
 /// Selection is done per target:
 /// - `aarch64`: NEON
 /// - `x86`/`x86_64`: runtime AVX2 detection, otherwise scalar fallback
 /// - everything else: historical scalar implementation
-#[cfg(target_arch = "aarch64")]
 pub fn compute_gradients(image: &FlatSamples<&[u8]>) -> GradientProduct {
-    unsafe { compute_gradients_neon(image) }
+    let width = image.layout.width;
+    let height = image.layout.height;
+    let mut grad_x: ImageBuffer<Luma<i16>, Vec<i16>> = ImageBuffer::new(width, height);
+    let mut grad_y: ImageBuffer<Luma<i16>, Vec<i16>> = ImageBuffer::new(width, height);
+    compute_gradients_into(image, &mut grad_x, &mut grad_y);
+    (grad_x, grad_y)
+}
+
+/// Compute gradients into caller-provided buffers. No heap allocation.
+///
+/// `grad_x` and `grad_y` must have dimensions matching `image.layout`. The
+/// output buffers are zeroed first (the SIMD paths only write to interior
+/// pixels, so borders rely on the initial zero state).
+pub fn compute_gradients_into(
+    image: &FlatSamples<&[u8]>,
+    grad_x: &mut ImageBuffer<Luma<i16>, Vec<i16>>,
+    grad_y: &mut ImageBuffer<Luma<i16>, Vec<i16>>,
+) {
+    debug_assert_eq!(grad_x.dimensions(), (image.layout.width, image.layout.height));
+    debug_assert_eq!(grad_y.dimensions(), (image.layout.width, image.layout.height));
+
+    // Zero the entire output (borders need it, and a fresh reuse may carry stale data).
+    grad_x.as_mut().fill(0);
+    grad_y.as_mut().fill(0);
+
+    compute_gradients_into_dispatch(image, grad_x, grad_y);
+}
+
+#[cfg(target_arch = "aarch64")]
+fn compute_gradients_into_dispatch(
+    image: &FlatSamples<&[u8]>,
+    grad_x: &mut ImageBuffer<Luma<i16>, Vec<i16>>,
+    grad_y: &mut ImageBuffer<Luma<i16>, Vec<i16>>,
+) {
+    unsafe { compute_gradients_neon_into(image, grad_x, grad_y) };
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-pub fn compute_gradients(image: &FlatSamples<&[u8]>) -> GradientProduct {
+fn compute_gradients_into_dispatch(
+    image: &FlatSamples<&[u8]>,
+    grad_x: &mut ImageBuffer<Luma<i16>, Vec<i16>>,
+    grad_y: &mut ImageBuffer<Luma<i16>, Vec<i16>>,
+) {
     if is_x86_feature_detected!("avx2") {
         unsafe {
-            return compute_gradients_avx2(image);
+            compute_gradients_avx2_into(image, grad_x, grad_y);
+            return;
         }
     }
-
-    compute_gradients_manual(image, &HORIZONTAL_SCHARR_3X3_OLD, &VERTICAL_SCHARR_3X3_OLD)
+    compute_gradients_manual_into(image, &HORIZONTAL_SCHARR_3X3_OLD, &VERTICAL_SCHARR_3X3_OLD, grad_x, grad_y);
 }
 
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")))]
-pub fn compute_gradients(image: &FlatSamples<&[u8]>) -> GradientProduct {
-    compute_gradients_manual(image, &HORIZONTAL_SCHARR_3X3_OLD, &VERTICAL_SCHARR_3X3_OLD)
+fn compute_gradients_into_dispatch(
+    image: &FlatSamples<&[u8]>,
+    grad_x: &mut ImageBuffer<Luma<i16>, Vec<i16>>,
+    grad_y: &mut ImageBuffer<Luma<i16>, Vec<i16>>,
+) {
+    compute_gradients_manual_into(image, &HORIZONTAL_SCHARR_3X3_OLD, &VERTICAL_SCHARR_3X3_OLD, grad_x, grad_y);
 }
 
-#[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
-fn zero_gradients(width: u32, height: u32) -> GradientProduct {
-    (
-        ImageBuffer::new(width, height),
-        ImageBuffer::new(width, height),
-    )
-}
-
-fn compute_gradients_manual(
+fn compute_gradients_manual_into(
     image: &FlatSamples<&[u8]>,
     kernel_x: &[i32; 9],
     kernel_y: &[i32; 9],
-) -> GradientProduct {
+    grad_x: &mut ImageBuffer<Luma<i16>, Vec<i16>>,
+    grad_y: &mut ImageBuffer<Luma<i16>, Vec<i16>>,
+) {
     let width = image.layout.width;
     let height = image.layout.height;
     let row_stride = image.layout.height_stride;
     let src = image.samples;
 
-    let mut grad_x = ImageBuffer::new(width, height);
-    let mut grad_y = ImageBuffer::new(width, height);
-
     if width < 3 || height < 3 {
-        return (grad_x, grad_y);
+        return;
     }
 
     for y in 1..height - 1 {
@@ -85,13 +120,32 @@ fn compute_gradients_manual(
             grad_y.put_pixel(x, y, Luma([gy as i16]));
         }
     }
+}
 
+/// Test-only wrapper around `compute_gradients_manual_into` that returns a
+/// fresh tuple, preserving the existing `selected_gradients_match_manual_reference`
+/// test contract.
+#[cfg(test)]
+fn compute_gradients_manual(
+    image: &FlatSamples<&[u8]>,
+    kernel_x: &[i32; 9],
+    kernel_y: &[i32; 9],
+) -> GradientProduct {
+    let width = image.layout.width;
+    let height = image.layout.height;
+    let mut grad_x = ImageBuffer::new(width, height);
+    let mut grad_y = ImageBuffer::new(width, height);
+    compute_gradients_manual_into(image, kernel_x, kernel_y, &mut grad_x, &mut grad_y);
     (grad_x, grad_y)
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn compute_gradients_avx2(image: &FlatSamples<&[u8]>) -> GradientProduct {
+unsafe fn compute_gradients_avx2_into(
+    image: &FlatSamples<&[u8]>,
+    grad_x: &mut ImageBuffer<Luma<i16>, Vec<i16>>,
+    grad_y: &mut ImageBuffer<Luma<i16>, Vec<i16>>,
+) {
     let width_u32 = image.layout.width;
     let height_u32 = image.layout.height;
     let width = width_u32 as usize;
@@ -99,12 +153,12 @@ unsafe fn compute_gradients_avx2(image: &FlatSamples<&[u8]>) -> GradientProduct 
     let row_stride = image.layout.height_stride;
 
     if width < 3 || height < 3 {
-        return zero_gradients(width_u32, height_u32);
+        return;
     }
 
     let src = image.samples;
-    let mut grad_x = vec![0i16; width * height];
-    let mut grad_y = vec![0i16; width * height];
+    let gx_dst: &mut [i16] = grad_x.as_mut();
+    let gy_dst: &mut [i16] = grad_y.as_mut();
 
     let coeff3 = _mm256_set1_epi16(3);
     let coeff10 = _mm256_set1_epi16(10);
@@ -150,8 +204,8 @@ unsafe fn compute_gradients_avx2(image: &FlatSamples<&[u8]>) -> GradientProduct 
             );
 
             unsafe {
-                _mm256_storeu_si256(grad_x.as_mut_ptr().add(row + x) as *mut __m256i, gx);
-                _mm256_storeu_si256(grad_y.as_mut_ptr().add(row + x) as *mut __m256i, gy);
+                _mm256_storeu_si256(gx_dst.as_mut_ptr().add(row + x) as *mut __m256i, gx);
+                _mm256_storeu_si256(gy_dst.as_mut_ptr().add(row + x) as *mut __m256i, gy);
             }
             x += 16;
         }
@@ -167,16 +221,11 @@ unsafe fn compute_gradients_avx2(image: &FlatSamples<&[u8]>) -> GradientProduct 
                     - (src[(y - 1) * row_stride + x - 1] as i32 + src[(y - 1) * row_stride + x + 1] as i32))
                 + 10 * (src[(y + 1) * row_stride + x] as i32 - src[(y - 1) * row_stride + x] as i32);
 
-            grad_x[idx] = gx as i16;
-            grad_y[idx] = gy as i16;
+            gx_dst[idx] = gx as i16;
+            gy_dst[idx] = gy as i16;
             x += 1;
         }
     }
-
-    (
-        ImageBuffer::from_vec(width_u32, height_u32, grad_x).unwrap(),
-        ImageBuffer::from_vec(width_u32, height_u32, grad_y).unwrap(),
-    )
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -187,7 +236,11 @@ unsafe fn load_u8x16_as_i16(ptr: *const u8) -> __m256i {
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn compute_gradients_neon(image: &FlatSamples<&[u8]>) -> GradientProduct {
+unsafe fn compute_gradients_neon_into(
+    image: &FlatSamples<&[u8]>,
+    grad_x: &mut ImageBuffer<Luma<i16>, Vec<i16>>,
+    grad_y: &mut ImageBuffer<Luma<i16>, Vec<i16>>,
+) {
     let width_u32 = image.layout.width;
     let height_u32 = image.layout.height;
     let width = width_u32 as usize;
@@ -195,12 +248,12 @@ unsafe fn compute_gradients_neon(image: &FlatSamples<&[u8]>) -> GradientProduct 
     let row_stride = image.layout.height_stride;
 
     if width < 3 || height < 3 {
-        return zero_gradients(width_u32, height_u32);
+        return;
     }
 
     let src = image.samples;
-    let mut grad_x = vec![0i16; width * height];
-    let mut grad_y = vec![0i16; width * height];
+    let gx_dst: &mut [i16] = grad_x.as_mut();
+    let gy_dst: &mut [i16] = grad_y.as_mut();
 
     let coeff3 = vdupq_n_s16(3);
     let coeff10 = vdupq_n_s16(10);
@@ -261,10 +314,10 @@ unsafe fn compute_gradients_neon(image: &FlatSamples<&[u8]>) -> GradientProduct 
             );
 
             unsafe {
-                vst1q_s16(grad_x.as_mut_ptr().add(row + x), gx_lo);
-                vst1q_s16(grad_x.as_mut_ptr().add(row + x + 8), gx_hi);
-                vst1q_s16(grad_y.as_mut_ptr().add(row + x), gy_lo);
-                vst1q_s16(grad_y.as_mut_ptr().add(row + x + 8), gy_hi);
+                vst1q_s16(gx_dst.as_mut_ptr().add(row + x), gx_lo);
+                vst1q_s16(gx_dst.as_mut_ptr().add(row + x + 8), gx_hi);
+                vst1q_s16(gy_dst.as_mut_ptr().add(row + x), gy_lo);
+                vst1q_s16(gy_dst.as_mut_ptr().add(row + x + 8), gy_hi);
             }
             x += 16;
         }
@@ -280,16 +333,11 @@ unsafe fn compute_gradients_neon(image: &FlatSamples<&[u8]>) -> GradientProduct 
                     - (src[(y - 1) * row_stride + x - 1] as i32 + src[(y - 1) * row_stride + x + 1] as i32))
                 + 10 * (src[(y + 1) * row_stride + x] as i32 - src[(y - 1) * row_stride + x] as i32);
 
-            grad_x[idx] = gx as i16;
-            grad_y[idx] = gy as i16;
+            gx_dst[idx] = gx as i16;
+            gy_dst[idx] = gy as i16;
             x += 1;
         }
     }
-
-    (
-        ImageBuffer::from_vec(width_u32, height_u32, grad_x).unwrap(),
-        ImageBuffer::from_vec(width_u32, height_u32, grad_y).unwrap(),
-    )
 }
 
 #[cfg(target_arch = "aarch64")]
