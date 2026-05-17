@@ -16,25 +16,37 @@ High-performance Rust implementation of Lucas-Kanade optical flow and Shi-Tomasi
 Add to your `Cargo.toml`:
 ```toml
 [dependencies]
-optical-flow-lk = "0.1"
+optical-flow-lk = "0.4"
 ```
 
-Basic example:
+## Quick start
+
 ```rust
-use image::{open, GrayImage, Rgba};
-use optical_flow_lk::{build_pyramid, calc_optical_flow, good_features_to_track};
+use image::open;
+use optical_flow_lk::OpticalFlowBuilder;
 
-let prev_frame: GrayImage = open("examples/input1.png").unwrap().clone().into_luma8();
-let next_frame: GrayImage = open("examples/input2.png").unwrap().clone().into_luma8();
+let prev_frame = open("examples/input1.png")?.into_luma8();
+let next_frame = open("examples/input2.png")?.into_luma8();
+let (w, h) = (prev_frame.width(), prev_frame.height());
 
-let prev_frame_pyr = build_pyramid(&prev_frame, 4);
-let next_frame_pyr = build_pyramid(&next_frame, 4);
+let mut buf = OpticalFlowBuilder::new(w, h)
+    .pyramid_levels(4)
+    .window_size(21)
+    .max_iterations(30)
+    .feature_quality_level(0.1)
+    .feature_min_distance(5)
+    .build();
 
-let mut points = good_features_to_track(&prev_frame, 0.1, 5);
-points.truncate(100);
-let prev_points: Vec<(f32, f32)> = points.iter().map(|&x| (x.0 as f32, x.1 as f32)).collect();
+// Prime the pipeline with the first frame and detect features on it.
+buf.push_frame(&prev_frame.as_flat_samples())?;
+buf.reset_with_good_features_to_track()?;
 
-let next_points = calc_optical_flow(&prev_frame_pyr, &next_frame_pyr, &prev_points, 21, 30);
+// Track those features into the next frame.
+buf.push_frame(&next_frame.as_flat_samples())?;
+
+for &(x, y) in buf.points() {
+    println!("tracked point at ({x}, {y})");
+}
 ```
 
 ## Zero-copy input — subrect or NV12 Y plane
@@ -88,36 +100,9 @@ buf.push_frame(&view)?;
 
 ## Real-time tracking — `OpticalFlowBuffer`
 
-For per-frame tracking loops, build an `OpticalFlowBuffer` once and call
-`push_frame` for each new frame. After warm-up the library performs zero
-heap allocations per frame.
-
-```rust
-use optical_flow_lk::OpticalFlowBuilder;
-
-let mut buf = OpticalFlowBuilder::new(width, height)
-    .pyramid_levels(3)
-    .window_size(21)
-    .max_iterations(30)
-    .feature_quality_level(0.4)
-    .feature_min_distance(10)
-    .build();
-
-// Prime the pipeline with the first frame and seed the points.
-buf.push_frame(&first_frame_view)?;
-buf.reset_with_good_features_to_track()?;
-
-for frame_view in frames {
-    buf.push_frame(&frame_view)?;
-    // buf.points() now holds the updated positions.
-    for &(x, y) in buf.points() {
-        // …
-    }
-}
-```
-
-`push_frame` accepts any `&FlatSamples<B>` matching the configured resolution,
-so subrects of larger images and NV12 Y planes are zero-copy.
+After the initial warm-up `OpticalFlowBuffer` performs zero heap allocations
+per frame. `push_frame` accepts any `&FlatSamples<B>` matching the configured
+resolution, so subrects of larger images and NV12 Y planes are zero-copy.
 
 `buf.points_mut()` allows direct manipulation of the tracked list — push, pop,
 or remove individual points without going through `reset`.

@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use image::{open, GrayImage, Rgba};
 use imageproc::drawing::{draw_cross_mut, draw_line_segment_mut};
 use optical_flow_lk::{build_pyramid, calc_optical_flow, good_features_to_track};

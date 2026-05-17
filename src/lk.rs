@@ -168,6 +168,16 @@ impl LkBuffer {
 ///
 /// # Returns
 /// Vector of points on next frame.
+///
+/// # Deprecated
+/// Use [`OpticalFlowBuilder`](crate::OpticalFlowBuilder) +
+/// [`OpticalFlowBuffer::push_frame`](crate::OpticalFlowBuffer::push_frame),
+/// which runs the same algorithm with reused buffers and accepts arbitrary
+/// `FlatSamples` input (including subrects and NV12 Y planes).
+#[deprecated(
+    since = "0.4.0",
+    note = "use OpticalFlowBuilder + OpticalFlowBuffer::push_frame"
+)]
 pub fn calc_optical_flow(
     prev_pyramid: &[GrayImage],
     curr_pyramid: &[GrayImage],

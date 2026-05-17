@@ -98,6 +98,15 @@ impl PyramidBuffer {
 ///
 /// # Returns
 /// Vector of layers in descending order of size. First element is source image.
+///
+/// # Deprecated
+/// Use [`OpticalFlowBuilder`](crate::OpticalFlowBuilder) +
+/// [`OpticalFlowBuffer`](crate::OpticalFlowBuffer); the pyramid is built
+/// internally by `push_frame` with zero per-frame allocations after warm-up.
+#[deprecated(
+    since = "0.4.0",
+    note = "use OpticalFlowBuilder + OpticalFlowBuffer; the pyramid is built internally by push_frame"
+)]
 pub fn build_pyramid(image: &GrayImage, levels: usize) -> Vec<GrayImage> {
     let (w, h) = image.dimensions();
     let mut buf = PyramidBuffer::with_capacity(w, h, levels);

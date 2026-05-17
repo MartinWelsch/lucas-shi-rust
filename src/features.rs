@@ -79,7 +79,7 @@ impl FeaturesBuffer {
     }
 }
 
-/// Finds good features points using the Shi-Tomasi algorithm
+/// Finds good feature points using the Shi-Tomasi algorithm.
 ///
 /// # Arguments
 /// * `image` - Target image (grayscale)
@@ -87,7 +87,16 @@ impl FeaturesBuffer {
 /// * `min_distance` - Filter points by distance between
 ///
 /// # Returns
-/// Vector of features with eigenvalue. Points sorted in descending order of quality
+/// Vector of features with eigenvalue. Points sorted in descending order of quality.
+///
+/// # Deprecated
+/// Use [`OpticalFlowBuilder`](crate::OpticalFlowBuilder) +
+/// [`OpticalFlowBuffer::reset_with_good_features_to_track`](crate::OpticalFlowBuffer::reset_with_good_features_to_track),
+/// which reuses pre-allocated detection buffers across calls.
+#[deprecated(
+    since = "0.4.0",
+    note = "use OpticalFlowBuilder + OpticalFlowBuffer::reset_with_good_features_to_track"
+)]
 pub fn good_features_to_track(
     image: &GrayImage,
     quality_level: f32,

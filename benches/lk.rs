@@ -14,6 +14,8 @@
 // - Bilinear interpolation is still done with checked pixel access in both variants, so it is
 //   likely the next meaningful optimization target inside the LK path.
 
+#![allow(deprecated)]
+
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
