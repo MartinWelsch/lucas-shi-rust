@@ -80,3 +80,148 @@ fn thin<B: AsRef<[u8]>>(fs: &FlatSamples<B>) -> FlatSamples<&[u8]> {
         color_hint: fs.color_hint,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::flat::SampleLayout;
+
+    fn make_layout(width: u32, height: u32, height_stride: usize) -> SampleLayout {
+        SampleLayout {
+            channels: 1,
+            channel_stride: 1,
+            width,
+            width_stride: 1,
+            height,
+            height_stride,
+        }
+    }
+
+    fn make_valid_samples(width: u32, height: u32) -> Vec<u8> {
+        vec![42u8; (width * height) as usize]
+    }
+
+    // --- happy paths ---
+
+    #[test]
+    fn build_pyramid_accepts_valid_input() {
+        let buf = make_valid_samples(8, 8);
+        let fs = FlatSamples {
+            samples: &buf[..],
+            layout: make_layout(8, 8, 8),
+            color_hint: None,
+        };
+        let pyr = build_pyramid(&fs, 3).expect("valid input must succeed");
+        assert_eq!(pyr.len(), 3);
+        assert_eq!(pyr[0].dimensions(), (8, 8));
+    }
+
+    #[test]
+    fn good_features_to_track_accepts_valid_input() {
+        let buf = make_valid_samples(16, 16);
+        let fs = FlatSamples {
+            samples: &buf[..],
+            layout: make_layout(16, 16, 16),
+            color_hint: None,
+        };
+        let _ = good_features_to_track(&fs, 0.1, 1)
+            .expect("valid input must succeed");
+    }
+
+    // --- error paths: build_pyramid ---
+
+    #[test]
+    fn build_pyramid_rejects_multi_channel() {
+        let buf = make_valid_samples(8, 8);
+        let mut layout = make_layout(8, 8, 8);
+        layout.channels = 3;
+        let fs = FlatSamples { samples: &buf[..], layout, color_hint: None };
+        assert_eq!(
+            build_pyramid(&fs, 2),
+            Err(LayoutError::UnsupportedChannels(3))
+        );
+    }
+
+    #[test]
+    fn build_pyramid_rejects_non_unit_width_stride() {
+        let buf = make_valid_samples(8, 8);
+        let mut layout = make_layout(8, 8, 8);
+        layout.width_stride = 3;
+        let fs = FlatSamples { samples: &buf[..], layout, color_hint: None };
+        assert_eq!(
+            build_pyramid(&fs, 2),
+            Err(LayoutError::UnsupportedWidthStride(3))
+        );
+    }
+
+    #[test]
+    fn build_pyramid_rejects_overlapping_rows() {
+        let buf = make_valid_samples(8, 8);
+        let layout = make_layout(8, 8, 4);
+        let fs = FlatSamples { samples: &buf[..], layout, color_hint: None };
+        assert_eq!(
+            build_pyramid(&fs, 2),
+            Err(LayoutError::OverlappingRows { height_stride: 4, width: 8 })
+        );
+    }
+
+    #[test]
+    fn build_pyramid_rejects_too_small_buffer() {
+        let buf = vec![0u8; 10];
+        let layout = make_layout(8, 8, 8);
+        let fs = FlatSamples { samples: &buf[..], layout, color_hint: None };
+        // required = (8 - 1) * 8 + 8 = 64, actual = 10
+        assert_eq!(
+            build_pyramid(&fs, 2),
+            Err(LayoutError::BufferTooSmall { required: 64, actual: 10 })
+        );
+    }
+
+    // --- error paths: good_features_to_track ---
+
+    #[test]
+    fn good_features_rejects_multi_channel() {
+        let buf = make_valid_samples(8, 8);
+        let mut layout = make_layout(8, 8, 8);
+        layout.channels = 4;
+        let fs = FlatSamples { samples: &buf[..], layout, color_hint: None };
+        assert_eq!(
+            good_features_to_track(&fs, 0.1, 1),
+            Err(LayoutError::UnsupportedChannels(4))
+        );
+    }
+
+    #[test]
+    fn good_features_rejects_non_unit_width_stride() {
+        let buf = make_valid_samples(8, 8);
+        let mut layout = make_layout(8, 8, 8);
+        layout.width_stride = 2;
+        let fs = FlatSamples { samples: &buf[..], layout, color_hint: None };
+        assert_eq!(
+            good_features_to_track(&fs, 0.1, 1),
+            Err(LayoutError::UnsupportedWidthStride(2))
+        );
+    }
+
+    #[test]
+    fn good_features_rejects_overlapping_rows() {
+        let buf = make_valid_samples(8, 8);
+        let layout = make_layout(8, 8, 7);
+        let fs = FlatSamples { samples: &buf[..], layout, color_hint: None };
+        assert_eq!(
+            good_features_to_track(&fs, 0.1, 1),
+            Err(LayoutError::OverlappingRows { height_stride: 7, width: 8 })
+        );
+    }
+
+    #[test]
+    fn good_features_rejects_too_small_buffer() {
+        let buf = vec![0u8; 5];
+        let layout = make_layout(8, 8, 8);
+        let fs = FlatSamples { samples: &buf[..], layout, color_hint: None };
+        assert_eq!(
+            good_features_to_track(&fs, 0.1, 1),
+            Err(LayoutError::BufferTooSmall { required: 64, actual: 5 })
+        );
+    }
+}
