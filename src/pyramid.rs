@@ -1,3 +1,4 @@
+use image::flat::FlatSamples;
 use image::{GrayImage, ImageBuffer, Luma};
 
 /// Builds a pyramid of images where each successive layer is half as large in width and height
@@ -11,8 +12,32 @@ use image::{GrayImage, ImageBuffer, Luma};
 /// # Returns
 /// Vector of layers in descending order of size. First element is source image
 pub fn build_pyramid(image: &GrayImage, levels: usize) -> Vec<GrayImage> {
-    let mut pyramid = Vec::new();
-    pyramid.push(image.clone());
+    build_pyramid_impl(&image.as_flat_samples(), levels)
+}
+
+pub(crate) fn build_pyramid_impl(
+    image: &FlatSamples<&[u8]>,
+    levels: usize,
+) -> Vec<GrayImage> {
+    let width = image.layout.width;
+    let height = image.layout.height;
+    let row_stride = image.layout.height_stride;
+    let src = image.samples;
+
+    // Allocate level 0 as a contiguous GrayImage by row-copying from the (possibly strided) view.
+    let mut level0: GrayImage = ImageBuffer::new(width, height);
+    {
+        let dst = level0.as_mut();
+        let dst_stride = width as usize;
+        for y in 0..height {
+            let src_off = y as usize * row_stride;
+            let dst_off = y as usize * dst_stride;
+            dst[dst_off..dst_off + dst_stride]
+                .copy_from_slice(&src[src_off..src_off + dst_stride]);
+        }
+    }
+
+    let mut pyramid = vec![level0];
 
     for level in 1..levels {
         let previous_level = &pyramid[level - 1];
