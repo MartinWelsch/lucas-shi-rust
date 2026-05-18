@@ -1,6 +1,28 @@
 use image::flat::FlatSamples;
 use image::{GrayImage, ImageBuffer, Luma};
 
+/// Compute the dimensions of each pyramid level given a starting
+/// `(width, height)`. Level 0 is the full resolution; each subsequent
+/// level halves both dimensions. The loop stops early if a halving
+/// would produce a level with either dimension < 2 — the returned Vec
+/// then has fewer entries than `levels`.
+pub(crate) fn pyramid_dims(width: u32, height: u32, levels: usize) -> Vec<(u32, u32)> {
+    let mut dims = Vec::with_capacity(levels);
+    let mut w = width;
+    let mut h = height;
+    for level in 0..levels {
+        dims.push((w, h));
+        if level + 1 < levels {
+            if w < 2 || h < 2 {
+                break;
+            }
+            w /= 2;
+            h /= 2;
+        }
+    }
+    dims
+}
+
 /// Reusable pyramid storage. Pre-allocates every level at construction;
 /// `build_into` overwrites the existing buffers from a new source view.
 pub(crate) struct PyramidBuffer {
@@ -12,19 +34,10 @@ impl PyramidBuffer {
     /// If a halving brings either dimension below 2, no further levels are allocated
     /// (matches the legacy `build_pyramid` early-exit behavior).
     pub(crate) fn with_capacity(width: u32, height: u32, levels: usize) -> Self {
-        let mut images = Vec::with_capacity(levels);
-        let mut w = width;
-        let mut h = height;
-        for level in 0..levels {
-            images.push(ImageBuffer::new(w, h));
-            if level + 1 < levels {
-                if w < 2 || h < 2 {
-                    break;
-                }
-                w /= 2;
-                h /= 2;
-            }
-        }
+        let images = pyramid_dims(width, height, levels)
+            .into_iter()
+            .map(|(w, h)| ImageBuffer::new(w, h))
+            .collect();
         Self { levels: images }
     }
 

@@ -1,4 +1,4 @@
-use image::{GrayImage, ImageBuffer, Luma};
+use image::{GrayImage, ImageBuffer, Luma, Primitive};
 
 use crate::utils::fast_gradients::compute_gradients_into;
 
@@ -26,21 +26,9 @@ impl LkBuffer {
         window_size: usize,
     ) -> Self {
         assert!(window_size % 2 == 1, "Window size must be odd");
-        let mut grad_x = Vec::with_capacity(levels);
-        let mut grad_y = Vec::with_capacity(levels);
-        let mut w = width;
-        let mut h = height;
-        for level in 0..levels {
-            grad_x.push(ImageBuffer::new(w, h));
-            grad_y.push(ImageBuffer::new(w, h));
-            if level + 1 < levels {
-                if w < 2 || h < 2 {
-                    break;
-                }
-                w /= 2;
-                h /= 2;
-            }
-        }
+        let dims = crate::pyramid::pyramid_dims(width, height, levels);
+        let grad_x: Vec<_> = dims.iter().map(|&(w, h)| ImageBuffer::new(w, h)).collect();
+        let grad_y: Vec<_> = dims.iter().map(|&(w, h)| ImageBuffer::new(w, h)).collect();
         let n_pixels = window_size * window_size;
         let radius = window_size / 2;
         Self {
@@ -103,8 +91,8 @@ impl LkBuffer {
                 for (idx, (ox, oy)) in self.offsets.iter().enumerate() {
                     let sample_x = x + ox;
                     let sample_y = y + oy;
-                    let ix = interpolate_alt(&self.grad_x[level], sample_x, sample_y) / 32.0;
-                    let iy = interpolate_alt(&self.grad_y[level], sample_x, sample_y) / 32.0;
+                    let ix = interpolate(&self.grad_x[level], sample_x, sample_y) / 32.0;
+                    let iy = interpolate(&self.grad_y[level], sample_x, sample_y) / 32.0;
 
                     self.prev_patch[idx] = interpolate(prev_img, sample_x, sample_y);
                     self.ix_patch[idx] = ix;
@@ -227,7 +215,10 @@ fn in_bounds(img: &GrayImage, x: f32, y: f32, radius: usize) -> bool {
 }
 
 /// Bilinear interpolation of the pixel value.
-fn interpolate(img: &GrayImage, x: f32, y: f32) -> f32 {
+fn interpolate<P>(img: &ImageBuffer<Luma<P>, Vec<P>>, x: f32, y: f32) -> f32
+where
+    P: Primitive + Into<f32>,
+{
     let x0 = x.floor() as i32;
     let y0 = y.floor() as i32;
     let x1 = x0 + 1;
@@ -236,36 +227,11 @@ fn interpolate(img: &GrayImage, x: f32, y: f32) -> f32 {
     let dx = x - x0 as f32;
     let dy = y - y0 as f32;
 
-    let mut sum = 0.0;
+    let mut sum = 0.0f32;
     for (sx, sy) in &[(x0, y0), (x0, y1), (x1, y0), (x1, y1)] {
         let px = img
             .get_pixel_checked(*sx as u32, *sy as u32)
-            .map(|p| p[0] as f32)
-            .unwrap_or(0.0);
-
-        let wx = if sx == &x0 { 1.0 - dx } else { dx };
-        let wy = if sy == &y0 { 1.0 - dy } else { dy };
-
-        sum += px * wx * wy;
-    }
-
-    sum
-}
-
-fn interpolate_alt(img: &ImageBuffer<Luma<i16>, Vec<i16>>, x: f32, y: f32) -> f32 {
-    let x0 = x.floor() as i32;
-    let y0 = y.floor() as i32;
-    let x1 = x0 + 1;
-    let y1 = y0 + 1;
-
-    let dx = x - x0 as f32;
-    let dy = y - y0 as f32;
-
-    let mut sum = 0.0;
-    for (sx, sy) in &[(x0, y0), (x0, y1), (x1, y0), (x1, y1)] {
-        let px = img
-            .get_pixel_checked(*sx as u32, *sy as u32)
-            .map(|p| p[0] as f32)
+            .map(|p| p[0].into())
             .unwrap_or(0.0);
 
         let wx = if sx == &x0 { 1.0 - dx } else { dx };
