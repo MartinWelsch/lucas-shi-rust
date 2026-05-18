@@ -51,7 +51,7 @@ fn measure<F: FnOnce()>(f: F) -> usize {
     THREAD_ALLOC_COUNT.with(|c| c.get())
 }
 
-fn make_view<'a>(buf: &'a [u8], width: u32, height: u32) -> FlatSamples<&'a [u8]> {
+fn make_view(buf: &[u8], width: u32, height: u32) -> FlatSamples<&[u8]> {
     FlatSamples {
         samples: buf,
         layout: SampleLayout {
@@ -70,7 +70,7 @@ fn checkerboard(width: u32, height: u32, cell: u32) -> Vec<u8> {
     let mut out = vec![0u8; (width * height) as usize];
     for y in 0..height {
         for x in 0..width {
-            let on = ((x / cell) + (y / cell)) % 2 == 0;
+            let on = ((x / cell) + (y / cell)).is_multiple_of(2);
             out[(y * width + x) as usize] = if on { 255 } else { 0 };
         }
     }

@@ -28,8 +28,12 @@ const DEFAULT_MAX_FEATURES: usize = 500;
 /// feature's strength unchanged.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Feature {
+    /// Sub-pixel x coordinate in image space.
     pub x: f32,
+    /// Sub-pixel y coordinate in image space.
     pub y: f32,
+    /// Shi-Tomasi min-eigenvalue from detection (≥ 0). Tracked features
+    /// preserve their input feature's `strength` unchanged.
     pub strength: f32,
 }
 
@@ -81,31 +85,52 @@ impl OpticalFlowBuilder {
         }
     }
 
+    /// Number of pyramid levels for both detection and LK tracking.
+    /// Level 0 is full resolution; each subsequent level halves both dimensions.
+    /// Must be > 0; `build()` panics otherwise. Default: 3.
     pub fn pyramid_levels(mut self, levels: usize) -> Self {
         self.pyramid_levels = levels;
         self
     }
 
+    /// Side length of the Lucas-Kanade search window, in pixels. Must be odd;
+    /// `build()` panics otherwise. Larger windows are more robust against
+    /// noise but more expensive; typical values are 11–31. Default: 21.
     pub fn window_size(mut self, size: usize) -> Self {
         self.window_size = size;
         self
     }
 
+    /// Maximum refinement iterations per pyramid level inside the LK
+    /// inner loop. Larger values converge more accurately on hard motion
+    /// but cost more per frame. Default: 30.
     pub fn max_iterations(mut self, n: usize) -> Self {
         self.max_iterations = n;
         self
     }
 
+    /// Shi-Tomasi quality threshold, expressed as a fraction (0.0..=1.0) of
+    /// the strongest corner's score in each frame. A candidate is kept iff
+    /// its min-eigenvalue ≥ `quality_level × strongest_score`. Lower → more
+    /// features kept. Default: 0.4.
     pub fn feature_quality_level(mut self, q: f32) -> Self {
         self.feature_quality_level = q;
         self
     }
 
+    /// Minimum spatial separation between accepted features, in pixels.
+    /// Larger → sparser, more spread-out detections. A value of 0 is
+    /// internally clamped to 1 to avoid division by zero in the grid
+    /// filter. Default: 10.
     pub fn feature_min_distance(mut self, d: u32) -> Self {
         self.feature_min_distance = d;
         self
     }
 
+    /// Hard upper bound on the number of features `detect_features` will
+    /// produce, and the pre-allocated capacity of the features/staging
+    /// Vecs. Cuts steady-state memory dramatically — for 1920×1080, going
+    /// from `width × height` to a few hundred saves tens of MB. Default: 500.
     pub fn max_features(mut self, n: usize) -> Self {
         self.max_features = n;
         self
@@ -192,8 +217,8 @@ impl OpticalFlowBuffer {
         image: &FlatSamples<B>,
     ) -> Result<(), TrackError> {
         validate_dimensions(image, self.width, self.height)?;
-        validate(image)?;
-        let thinned = thin(image);
+        validate_layout(image)?;
+        let thinned = as_byte_view(image);
 
         std::mem::swap(&mut self.prev_frame, &mut self.curr_frame);
         self.curr_frame.pyramid.build_into(&thinned);
@@ -322,30 +347,37 @@ impl OpticalFlowBuffer {
         self.has_prev
     }
 
+    /// `(width, height)` configured at build time.
     pub fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
     }
 
+    /// Number of pyramid levels configured at build time.
     pub fn pyramid_levels(&self) -> usize {
         self.pyramid_levels
     }
 
+    /// Configured LK search window side length, in pixels.
     pub fn window_size(&self) -> usize {
         self.window_size
     }
 
+    /// Configured maximum LK refinement iterations per pyramid level.
     pub fn max_iterations(&self) -> usize {
         self.max_iterations
     }
 
+    /// Configured Shi-Tomasi quality threshold (0.0..=1.0).
     pub fn feature_quality_level(&self) -> f32 {
         self.feature_quality_level
     }
 
+    /// Configured minimum spatial separation between features, in pixels.
     pub fn feature_min_distance(&self) -> u32 {
         self.feature_min_distance
     }
 
+    /// Configured upper bound on detected features.
     pub fn max_features(&self) -> usize {
         self.max_features
     }
@@ -364,7 +396,7 @@ fn validate_dimensions<B: AsRef<[u8]>>(
     Ok(())
 }
 
-fn validate<B: AsRef<[u8]>>(fs: &FlatSamples<B>) -> Result<(), crate::LayoutError> {
+fn validate_layout<B: AsRef<[u8]>>(fs: &FlatSamples<B>) -> Result<(), crate::LayoutError> {
     use crate::LayoutError;
     if fs.layout.channels != 1 {
         return Err(LayoutError::UnsupportedChannels(fs.layout.channels));
@@ -391,7 +423,7 @@ fn validate<B: AsRef<[u8]>>(fs: &FlatSamples<B>) -> Result<(), crate::LayoutErro
     Ok(())
 }
 
-fn thin<B: AsRef<[u8]>>(fs: &FlatSamples<B>) -> FlatSamples<&[u8]> {
+fn as_byte_view<B: AsRef<[u8]>>(fs: &FlatSamples<B>) -> FlatSamples<&[u8]> {
     FlatSamples {
         samples: fs.samples.as_ref(),
         layout: fs.layout,
@@ -405,7 +437,7 @@ mod tests {
     use crate::LayoutError;
     use image::flat::SampleLayout;
 
-    fn make_view<'a>(buf: &'a [u8], width: u32, height: u32) -> FlatSamples<&'a [u8]> {
+    fn make_view(buf: &[u8], width: u32, height: u32) -> FlatSamples<&[u8]> {
         FlatSamples {
             samples: buf,
             layout: SampleLayout {
@@ -424,7 +456,7 @@ mod tests {
         let mut out = vec![0u8; (width * height) as usize];
         for y in 0..height {
             for x in 0..width {
-                let on = ((x / cell) + (y / cell)) % 2 == 0;
+                let on = ((x / cell) + (y / cell)).is_multiple_of(2);
                 out[(y * width + x) as usize] = if on { 255 } else { 0 };
             }
         }
@@ -536,7 +568,7 @@ mod tests {
     #[test]
     fn layout_error_unsupported_channels() {
         let mut buf = OpticalFlowBuilder::new(8, 8).build();
-        let data = vec![0u8; 8 * 8 * 3];
+        let data = [0u8; 8 * 8 * 3];
         let view = FlatSamples {
             samples: &data[..],
             layout: SampleLayout {
@@ -556,7 +588,7 @@ mod tests {
     #[test]
     fn layout_error_unsupported_width_stride() {
         let mut buf = OpticalFlowBuilder::new(8, 8).build();
-        let data = vec![0u8; 8 * 8 * 2];
+        let data = [0u8; 8 * 8 * 2];
         let view = FlatSamples {
             samples: &data[..],
             layout: SampleLayout {
@@ -579,7 +611,7 @@ mod tests {
     #[test]
     fn layout_error_overlapping_rows() {
         let mut buf = OpticalFlowBuilder::new(8, 8).build();
-        let data = vec![0u8; 8 * 8];
+        let data = [0u8; 8 * 8];
         let view = FlatSamples {
             samples: &data[..],
             layout: SampleLayout {
@@ -605,7 +637,7 @@ mod tests {
     #[test]
     fn layout_error_buffer_too_small() {
         let mut buf = OpticalFlowBuilder::new(8, 8).build();
-        let data = vec![0u8; 10];
+        let data = [0u8; 10];
         let view = FlatSamples {
             samples: &data[..],
             layout: SampleLayout {

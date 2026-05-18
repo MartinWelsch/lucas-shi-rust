@@ -62,7 +62,7 @@ impl LkBuffer {
         &mut self,
         prev_pyramid: &[GrayImage],
         curr_pyramid: &[GrayImage],
-        points: &mut Vec<(f32, f32)>,
+        points: &mut [(f32, f32)],
         max_iterations: usize,
     ) {
         assert_eq!(prev_pyramid.len(), curr_pyramid.len());

@@ -298,6 +298,7 @@ fn interpolate_alt(img: &GrayI16Image, x: f32, y: f32) -> f32 {
     sum
 }
 
+#[allow(clippy::type_complexity)]
 fn load_case() -> (
     Vec<GrayImage>,
     Vec<GrayImage>,

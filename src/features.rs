@@ -226,7 +226,7 @@ fn filter_by_distance_into(
     grid: &mut Vec<Option<(u32, u32)>>,
     out: &mut Vec<(u32, u32, f32)>,
 ) {
-    let cell_size = min_distance;
+    let cell_size = min_distance.max(1);
     let grid_width = width.div_ceil(cell_size);
     let grid_height = height.div_ceil(cell_size);
     let cells = (grid_width * grid_height) as usize;

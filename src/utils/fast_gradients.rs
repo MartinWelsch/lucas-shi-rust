@@ -16,7 +16,7 @@ const VERTICAL_SCHARR_3X3_OLD: [i32; 9] = [-3, -10, -3, 0, 0, 0, 3, 10, 3];
 /// `grad_x` and `grad_y` must have dimensions matching `image.layout`. The
 /// output buffers are zeroed first (the SIMD paths only write to interior
 /// pixels, so borders rely on the initial zero state).
-pub fn compute_gradients_into(
+pub(crate) fn compute_gradients_into(
     image: &FlatSamples<&[u8]>,
     grad_x: &mut ImageBuffer<Luma<i16>, Vec<i16>>,
     grad_y: &mut ImageBuffer<Luma<i16>, Vec<i16>>,

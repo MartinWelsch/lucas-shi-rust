@@ -1,6 +1,6 @@
 use image::{ImageBuffer, Luma};
 
-pub fn box_filter_3x3_in_place(image: &mut ImageBuffer<Luma<i16>, Vec<i16>>) {
+pub(crate) fn box_filter_3x3_in_place(image: &mut ImageBuffer<Luma<i16>, Vec<i16>>) {
     // Apply the separable 3x3 box filter: first across rows, then across columns
     box_filter_horizontal_3x3_in_place(image);
     box_filter_vertical_3x3_in_place(image);

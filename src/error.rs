@@ -45,8 +45,8 @@ mod tests {
 /// Errors returned by [`OpticalFlowBuffer`] operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrackError {
-    /// The provided `FlatSamples` failed the same layout checks as the
-    /// `generic::*` entry points (channels, stride, buffer length).
+    /// The provided `FlatSamples` failed the layout checks performed by
+    /// [`OpticalFlowBuffer::push_frame`] — channels, stride, buffer length.
     Layout(LayoutError),
 
     /// `image.layout.width` or `.height` did not match the buffer's
