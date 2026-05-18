@@ -271,6 +271,25 @@ impl OpticalFlowBuffer {
         &self.prev_frame.features
     }
 
+    /// Mutable view of the current frame's feature list. Callers may push,
+    /// pop, retain, or modify individual entries. The next
+    /// [`good_features_to_track`](Self::good_features_to_track) or
+    /// [`calculate_flow`](Self::calculate_flow) call will overwrite the list
+    /// in place — manual edits made after one of those calls are preserved
+    /// until the next call that writes the list.
+    pub fn current_features_mut(&mut self) -> &mut Vec<Feature> {
+        &mut self.curr_frame.features
+    }
+
+    /// Mutable view of the previous frame's feature list. The next
+    /// [`calculate_flow`](Self::calculate_flow) reads from this list, so
+    /// manual edits made before that call drive what gets tracked. Note
+    /// that the next [`push_frame`](Self::push_frame) will swap this list
+    /// into the current frame's slot.
+    pub fn previous_features_mut(&mut self) -> &mut Vec<Feature> {
+        &mut self.prev_frame.features
+    }
+
     // --- read-only accessors ---
 
     /// True after at least one `push_frame` call.
@@ -602,5 +621,65 @@ mod tests {
         assert_eq!(buf.max_iterations(), 20);
         assert!((buf.feature_quality_level() - 0.25).abs() < 1e-6);
         assert_eq!(buf.feature_min_distance(), 7);
+    }
+
+    #[test]
+    fn current_features_mut_allows_caller_edits() {
+        let mut buf = OpticalFlowBuilder::new(16, 16).build();
+        let frame = vec![0u8; 16 * 16];
+        buf.push_frame(&make_view(&frame, 16, 16)).unwrap();
+
+        buf.current_features_mut().push(Feature {
+            x: 1.0,
+            y: 2.0,
+            strength: 3.0,
+        });
+        buf.current_features_mut().push(Feature {
+            x: 4.0,
+            y: 5.0,
+            strength: 6.0,
+        });
+        assert_eq!(buf.current_features().len(), 2);
+
+        buf.current_features_mut().retain(|f| f.x > 2.0);
+        assert_eq!(buf.current_features().len(), 1);
+        assert_eq!(buf.current_features()[0].x, 4.0);
+    }
+
+    #[test]
+    fn previous_features_mut_seeds_what_calculate_flow_tracks() {
+        const W: u32 = 32;
+        const H: u32 = 32;
+        let frame_a = vec![128u8; (W * H) as usize];
+        let frame_b: Vec<u8> = frame_a.iter().map(|p| p.wrapping_add(1)).collect();
+
+        let mut buf = OpticalFlowBuilder::new(W, H)
+            .pyramid_levels(2)
+            .window_size(5)
+            .max_iterations(5)
+            .build();
+
+        buf.push_frame(&make_view(&frame_a, W, H)).unwrap();
+        buf.push_frame(&make_view(&frame_b, W, H)).unwrap();
+        // After two pushes both feature lists are empty.
+        assert!(buf.previous_features().is_empty());
+
+        // Manually seed previous_features so calculate_flow has something to track.
+        buf.previous_features_mut().push(Feature {
+            x: 10.0,
+            y: 10.0,
+            strength: 1.0,
+        });
+        buf.previous_features_mut().push(Feature {
+            x: 20.0,
+            y: 20.0,
+            strength: 2.0,
+        });
+
+        buf.calculate_flow().unwrap();
+        assert_eq!(buf.current_features().len(), 2);
+        // Strength preserved from the manually seeded inputs.
+        assert_eq!(buf.current_features()[0].strength, 1.0);
+        assert_eq!(buf.current_features()[1].strength, 2.0);
     }
 }
