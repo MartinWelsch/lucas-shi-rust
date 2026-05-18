@@ -9,6 +9,7 @@
 use image::flat::FlatSamples;
 
 use crate::error::TrackError;
+use crate::feature::Feature;
 use crate::features::FeaturesBuffer;
 use crate::lk::LkBuffer;
 use crate::pyramid::PyramidBuffer;
@@ -19,23 +20,6 @@ const DEFAULT_MAX_ITERATIONS: usize = 30;
 const DEFAULT_FEATURE_QUALITY_LEVEL: f32 = 0.4;
 const DEFAULT_FEATURE_MIN_DISTANCE: u32 = 10;
 const DEFAULT_MAX_FEATURES: usize = 500;
-
-/// A tracked feature point with spatial position and detection strength.
-///
-/// `strength` is the Shi-Tomasi min-eigenvalue from feature detection
-/// (always >= 0). Features produced by
-/// [`calculate_flow`](OpticalFlowBuffer::calculate_flow) inherit their input
-/// feature's strength unchanged.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Feature {
-    /// Sub-pixel x coordinate in image space.
-    pub x: f32,
-    /// Sub-pixel y coordinate in image space.
-    pub y: f32,
-    /// Shi-Tomasi min-eigenvalue from detection (≥ 0). Tracked features
-    /// preserve their input feature's `strength` unchanged.
-    pub strength: f32,
-}
 
 /// Pyramid image data plus the features associated with that frame.
 ///
@@ -153,6 +137,7 @@ impl OpticalFlowBuilder {
             self.height,
             self.pyramid_levels,
             self.window_size,
+            self.max_features,
         );
         let features_buffer = FeaturesBuffer::with_capacity(
             self.width,
@@ -174,7 +159,6 @@ impl OpticalFlowBuilder {
             curr_frame,
             lk_buffer,
             features_buffer,
-            staging_positions: Vec::with_capacity(self.max_features),
             has_curr: false,
             has_prev: false,
         }
@@ -201,9 +185,6 @@ pub struct OpticalFlowBuffer {
     curr_frame: FrameBuffer,
     lk_buffer: LkBuffer,
     features_buffer: FeaturesBuffer,
-    /// Reusable staging Vec for the LK call (LkBuffer takes `Vec<(f32, f32)>`).
-    /// Grows during warm-up to the steady-state feature count, then reused.
-    staging_positions: Vec<(f32, f32)>,
 
     has_curr: bool,
     has_prev: bool,
@@ -272,30 +253,22 @@ impl OpticalFlowBuffer {
             return Err(TrackError::NoPreviousFrame);
         }
 
-        // Stage previous positions for LK.
-        self.staging_positions.clear();
-        self.staging_positions
-            .extend(self.prev_frame.features.iter().map(|f| (f.x, f.y)));
+        let Self {
+            prev_frame,
+            curr_frame,
+            lk_buffer,
+            max_iterations,
+            ..
+        } = self;
 
-        self.lk_buffer.calc_into(
-            self.prev_frame.pyramid.levels(),
-            self.curr_frame.pyramid.levels(),
-            &mut self.staging_positions,
-            self.max_iterations,
+        lk_buffer.calc_into(
+            prev_frame.pyramid.levels(),
+            curr_frame.pyramid.levels(),
+            &prev_frame.features,
+            &mut curr_frame.features,
+            *max_iterations,
         );
 
-        self.curr_frame.features.clear();
-        self.curr_frame.features.extend(
-            self.prev_frame
-                .features
-                .iter()
-                .zip(self.staging_positions.iter())
-                .map(|(prev, &(x, y))| Feature {
-                    x,
-                    y,
-                    strength: prev.strength,
-                }),
-        );
         Ok(())
     }
 
@@ -726,6 +699,82 @@ mod tests {
         buf.current_features_mut().retain(|f| f.x > 2.0);
         assert_eq!(buf.current_features().len(), 1);
         assert_eq!(buf.current_features()[0].x, 4.0);
+    }
+
+    #[test]
+    fn calculate_flow_recovers_known_translation() {
+        const W: u32 = 64;
+        const H: u32 = 64;
+        const DX: i32 = 3;
+        const DY: i32 = -2;
+
+        // A synthetic image with multiple overlapping squares to create strong,
+        // unique corners at the tracking point (30, 30).
+        let frame_a: Vec<u8> = (0..(W * H) as usize)
+            .map(|i| {
+                let x = (i as u32) % W;
+                let y = (i as u32) / W;
+                // Horizontal stripes of varying width to create trackable gradients.
+                let stripe = (y / 3) % 4;
+                // Vertical stripes interleaved.
+                let vstripe = (x / 3) % 4;
+                // Combined to make a unique grid pattern with no large-scale periodicity.
+                (stripe.wrapping_mul(50) + vstripe.wrapping_mul(30)) as u8
+            })
+            .collect();
+
+        // frame_b = frame_a shifted by (DX, DY). Out-of-bounds pixels = 0.
+        let mut frame_b = vec![0u8; (W * H) as usize];
+        for y in 0..H as i32 {
+            for x in 0..W as i32 {
+                let sx = x - DX;
+                let sy = y - DY;
+                if sx >= 0 && sx < W as i32 && sy >= 0 && sy < H as i32 {
+                    frame_b[(y as u32 * W + x as u32) as usize] =
+                        frame_a[(sy as u32 * W + sx as u32) as usize];
+                }
+            }
+        }
+
+        let mut buf = OpticalFlowBuilder::new(W, H)
+            .pyramid_levels(2)
+            .window_size(7)
+            .max_iterations(20)
+            .build();
+
+        buf.push_frame(&make_view(&frame_a, W, H)).unwrap();
+        // frame_a is now curr_frame. Seed the feature into curr_frame.features.
+        buf.current_features_mut().push(Feature {
+            x: 30.0,
+            y: 30.0,
+            strength: 1.0,
+        });
+
+        buf.push_frame(&make_view(&frame_b, W, H)).unwrap();
+        // After the swap, the seeded feature is now in previous_features.
+        // curr_frame is frame_b with empty features.
+        assert_eq!(buf.previous_features().len(), 1);
+        assert_eq!(buf.current_features().len(), 0);
+
+        buf.calculate_flow().unwrap();
+        // After calculate_flow, curr_frame.features has the tracked positions.
+
+        assert_eq!(buf.current_features().len(), 1);
+        let tracked = buf.current_features()[0];
+        let expected_x = 30.0 + DX as f32;
+        let expected_y = 30.0 + DY as f32;
+        let err_x = (tracked.x - expected_x).abs();
+        let err_y = (tracked.y - expected_y).abs();
+        assert!(
+            err_x < 1.0 && err_y < 1.0,
+            "tracked ({}, {}) more than 1 px off expected ({}, {})",
+            tracked.x,
+            tracked.y,
+            expected_x,
+            expected_y,
+        );
+        // Strength is preserved.
+        assert_eq!(tracked.strength, 1.0);
     }
 
     #[test]

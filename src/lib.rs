@@ -20,12 +20,14 @@
 
 mod buffer;
 mod error;
+mod feature;
 mod features;
 mod lk;
 mod pyramid;
 mod utils;
 
-pub use buffer::{Feature, OpticalFlowBuffer, OpticalFlowBuilder};
+pub use buffer::{OpticalFlowBuffer, OpticalFlowBuilder};
+pub use feature::Feature;
 pub use error::{LayoutError, TrackError};
 #[allow(deprecated)]
 pub use features::good_features_to_track;

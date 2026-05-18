@@ -1,5 +1,6 @@
 use image::{GrayImage, ImageBuffer, Luma, Primitive};
 
+use crate::feature::Feature;
 use crate::utils::fast_gradients::compute_gradients_into;
 
 /// Reusable storage for the Lucas-Kanade tracking pipeline. Pre-allocates
@@ -24,6 +25,7 @@ impl LkBuffer {
         height: u32,
         levels: usize,
         window_size: usize,
+        max_features: usize,
     ) -> Self {
         assert!(window_size % 2 == 1, "Window size must be odd");
         let dims = crate::pyramid::pyramid_dims(width, height, levels);
@@ -37,20 +39,22 @@ impl LkBuffer {
             prev_patch: vec![0.0; n_pixels],
             ix_patch: vec![0.0; n_pixels],
             iy_patch: vec![0.0; n_pixels],
-            displacements: Vec::new(),
+            displacements: Vec::with_capacity(max_features),
             offsets: build_window_offsets(radius),
             window_size,
         }
     }
 
-    /// Compute flow from `prev_pyramid` to `curr_pyramid` for the points in
-    /// `points`, writing the updated positions back in place. No heap
-    /// allocation when the buffer was sized for the same parameters.
+    /// Compute flow from `prev_pyramid` to `curr_pyramid` for the features in
+    /// `prev_features`, writing new tracked `Feature` values into `out_features`
+    /// (cleared first). Strength is copied from input to output unchanged. No
+    /// heap allocation when the buffer was sized for the same parameters.
     pub(crate) fn calc_into(
         &mut self,
         prev_pyramid: &[GrayImage],
         curr_pyramid: &[GrayImage],
-        points: &mut [(f32, f32)],
+        prev_features: &[Feature],
+        out_features: &mut Vec<Feature>,
         max_iterations: usize,
     ) {
         assert_eq!(prev_pyramid.len(), curr_pyramid.len());
@@ -61,7 +65,7 @@ impl LkBuffer {
         let det_epsilon = 1e-6;
 
         self.displacements.clear();
-        self.displacements.resize(points.len(), (0.0, 0.0));
+        self.displacements.resize(prev_features.len(), (0.0, 0.0));
 
         for level in (0..n_levels).rev() {
             let scale = 2f32.powi(level as i32);
@@ -74,9 +78,9 @@ impl LkBuffer {
                 &mut self.grad_y[level],
             );
 
-            for ((prev_x, prev_y), disp) in points.iter().zip(self.displacements.iter_mut()) {
-                let x = *prev_x / scale;
-                let y = *prev_y / scale;
+            for (feat, disp) in prev_features.iter().zip(self.displacements.iter_mut()) {
+                let x = feat.x / scale;
+                let y = feat.y / scale;
                 let mut dx = disp.0 / scale;
                 let mut dy = disp.1 / scale;
 
@@ -138,10 +142,14 @@ impl LkBuffer {
             }
         }
 
-        for (pt, disp) in points.iter_mut().zip(self.displacements.iter()) {
-            pt.0 += disp.0;
-            pt.1 += disp.1;
-        }
+        out_features.clear();
+        out_features.extend(prev_features.iter().zip(self.displacements.iter()).map(
+            |(prev, disp)| Feature {
+                x: prev.x + disp.0,
+                y: prev.y + disp.1,
+                strength: prev.strength,
+            },
+        ));
     }
 }
 
@@ -175,15 +183,20 @@ pub fn calc_optical_flow(
 ) -> Vec<(f32, f32)> {
     let (w, h) = prev_pyramid[0].dimensions();
     let levels = prev_pyramid.len();
-    let mut buf = LkBuffer::with_capacity(w, h, levels, window_size);
-    let mut points = prev_points.to_vec();
+    let mut buf = LkBuffer::with_capacity(w, h, levels, window_size, prev_points.len());
+    let prev_features: Vec<Feature> = prev_points
+        .iter()
+        .map(|&(x, y)| Feature { x, y, strength: 0.0 })
+        .collect();
+    let mut out_features: Vec<Feature> = Vec::with_capacity(prev_features.len());
     buf.calc_into(
         prev_pyramid,
         curr_pyramid,
-        &mut points,
+        &prev_features,
+        &mut out_features,
         max_iterations,
     );
-    points
+    out_features.into_iter().map(|f| (f.x, f.y)).collect()
 }
 
 fn build_window_offsets(radius: usize) -> Vec<(f32, f32)> {
