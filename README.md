@@ -30,11 +30,12 @@ let mut buf = OpticalFlowBuilder::new(width, height)
     .max_iterations(30)
     .feature_quality_level(0.1)
     .feature_min_distance(5)
+    .max_features(300)  // cap detection output (default: 500)
     .build();
 
 // Prime the pipeline with the first frame and detect features on it.
 buf.push_frame(&first_frame_view)?;
-buf.good_features_to_track()?;
+buf.detect_features()?;
 
 // Track those features through subsequent frames.
 for frame_view in frames {
@@ -105,6 +106,6 @@ Feature buffers are owned by the pipeline and are accessible via
 `current_features()` and `previous_features()`. Each `Feature` carries its
 spatial position and its Shi-Tomasi strength through tracking.
 
-Re-detect features at any time by calling `good_features_to_track()` after a
+Re-detect features at any time by calling `detect_features()` after a
 `push_frame`. The next `calculate_flow()` call will track whatever features
 are in the previous frame buffer.

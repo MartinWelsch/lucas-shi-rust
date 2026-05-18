@@ -1,6 +1,6 @@
 # Spec: `OpticalFlowBuilder` / `OpticalFlowBuffer` — Allocation-Free Per-Frame Pipeline
 
-**Status:** Draft (rev 10)
+**Status:** Draft (rev 11)
 **Date:** 2026-05-17
 **Scope:** New public types `OpticalFlowBuilder` and `OpticalFlowBuffer` for a steady-state, zero-per-frame-allocation tracking loop. Existing `build_pyramid`, `good_features_to_track`, `calc_optical_flow`, and `generic::*` APIs unchanged.
 
@@ -63,13 +63,14 @@ pub struct OpticalFlowBuilder {
     max_iterations: usize,
     feature_quality_level: f32,
     feature_min_distance: u32,
+    max_features: usize,
 }
 
 impl OpticalFlowBuilder {
     /// Start a builder for a fixed-resolution pipeline.
     ///
     /// Defaults: 3 pyramid levels, 21x21 window, 30 max iterations,
-    /// quality_level=0.4, min_distance=10.
+    /// quality_level=0.4, min_distance=10, max_features=500.
     pub fn new(width: u32, height: u32) -> Self;
 
     pub fn pyramid_levels(self, levels: usize) -> Self;
@@ -77,6 +78,7 @@ impl OpticalFlowBuilder {
     pub fn max_iterations(self, n: usize) -> Self;
     pub fn feature_quality_level(self, q: f32) -> Self;
     pub fn feature_min_distance(self, d: u32) -> Self;
+    pub fn max_features(self, n: usize) -> Self;
 
     /// Construct the buffer, pre-allocating all internal storage.
     /// Panics if `width == 0`, `height == 0`, `pyramid_levels == 0`,
@@ -145,13 +147,14 @@ impl OpticalFlowBuffer {
         image: &FlatSamples<B>,
     ) -> Result<(), TrackError>;
 
-    /// Detect Shi-Tomasi features on the current frame and write them into
-    /// `current_features()` (cleared first). Uses the builder's
-    /// `feature_quality_level` and `feature_min_distance` settings.
-    /// Each feature carries its Shi-Tomasi min-eigenvalue as `strength`.
+    /// Detect Shi-Tomasi corner features on the current frame.
+    ///
+    /// Writes up to `max_features` features into `current_features()` (cleared
+    /// first), in descending quality order. Features are filtered by
+    /// `feature_quality_level` and spaced by at least `feature_min_distance`.
     ///
     /// Errors with `TrackError::NoCurrentFrame` if no frame has been pushed.
-    pub fn good_features_to_track(&mut self) -> Result<(), TrackError>;
+    pub fn detect_features(&mut self) -> Result<(), TrackError>;
 
     /// Track `previous_features()` from the previous frame into the current
     /// frame using Lucas-Kanade. Writes results into `current_features()`
@@ -187,6 +190,7 @@ impl OpticalFlowBuffer {
     pub fn max_iterations(&self) -> usize;
     pub fn feature_quality_level(&self) -> f32;
     pub fn feature_min_distance(&self) -> u32;
+    pub fn max_features(&self) -> usize;
 }
 ```
 
@@ -237,7 +241,7 @@ push_frame(f0):
   has_curr = true
   State: prev = { ~, [] }, curr = { f0, [] }
 
-good_features_to_track():
+detect_features():
   detect on curr.pyramid.level(0) = f0
   curr_frame.features = features_in_f0 (each as Feature { x, y, strength })
   State: prev = { ~, [] }, curr = { f0, F0 }
@@ -275,7 +279,7 @@ buf.push_frame(&f0)?;
 // current_features() is empty (push clears it)
 
 // 2. Detect features on curr (= f0).
-buf.good_features_to_track()?;
+buf.detect_features()?;
 // current_features() == F0
 
 // 3. Second frame rotates: prev = { f0, F0 }, curr = { f1, [] }
@@ -294,14 +298,14 @@ buf.calculate_flow()?;
 
 // 6. Re-detect at any time after at least one push_frame.
 buf.push_frame(&f3)?;
-buf.good_features_to_track()?;  // re-seeds curr with fresh detections
+buf.detect_features()?;  // re-seeds curr with fresh detections
 ```
 
 Rules:
 - `push_frame` always performs swap-then-build: `swap(prev_frame, curr_frame)` first, then `curr_frame.pyramid.build_into(image)`, then `curr_frame.features.clear()`. It never runs optical flow.
 - `has_curr` flips to `true` on the first `push_frame` call.
 - `has_prev` flips to `true` on the second `push_frame` call (i.e., when `has_curr` was already `true` at the start of `push_frame`).
-- `good_features_to_track` requires `has_curr`; detects on `curr_frame.pyramid` and writes into `curr_frame.features`.
+- `detect_features` requires `has_curr`; detects on `curr_frame.pyramid` and writes into `curr_frame.features` (up to `max_features` results).
 - `calculate_flow` requires `has_prev`; reads `prev_frame.features` positions, runs LK between `prev_frame.pyramid` and `curr_frame.pyramid`, writes `curr_frame.features` with preserved strengths.
 - Feature lists travel with their owning `FrameBuffer` through the prev/curr swap, so `previous_features()` always reflects "the frame we just tracked from".
 

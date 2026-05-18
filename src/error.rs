@@ -57,7 +57,7 @@ pub enum TrackError {
     /// so there is no `prev` frame to track from.
     NoPreviousFrame,
 
-    /// `good_features_to_track` was called before any frame had been pushed,
+    /// `detect_features` was called before any frame had been pushed,
     /// so there is nothing to detect features on.
     NoCurrentFrame,
 }

@@ -20,8 +20,9 @@ pub(crate) struct FeaturesBuffer {
 
 impl FeaturesBuffer {
     /// Pre-allocate every buffer using best-effort upper bounds derived from
-    /// the configured resolution and `min_distance`.
-    pub(crate) fn with_capacity(width: u32, height: u32, min_distance: u32) -> Self {
+    /// the configured resolution and `min_distance`. `max_features` caps the
+    /// capacity of the `out` Vec (and the short-circuit in `detect_into`).
+    pub(crate) fn with_capacity(width: u32, height: u32, min_distance: u32, max_features: usize) -> Self {
         let pixels = (width as usize) * (height as usize);
         let cell_size = min_distance.max(1);
         let grid_width = width.div_ceil(cell_size);
@@ -37,7 +38,7 @@ impl FeaturesBuffer {
             features: Vec::with_capacity(pixels),
             is_local_max: vec![false; pixels],
             grid: vec![None; cells],
-            out: Vec::with_capacity(pixels),
+            out: Vec::with_capacity(max_features),
         }
     }
 
@@ -45,11 +46,13 @@ impl FeaturesBuffer {
     /// `(x, y, min_eigenvalue)` triples filtered by quality and distance.
     /// The returned slice borrows from `self.out`. No heap allocation when
     /// the buffer was sized for the same resolution and min_distance.
+    /// At most `max_features` entries are returned (top-quality first).
     pub(crate) fn detect_into(
         &mut self,
         image: &FlatSamples<&[u8]>,
         quality_level: f32,
         min_distance: u32,
+        max_features: usize,
     ) -> &[(u32, u32, f32)] {
         let width = image.layout.width;
         let height = image.layout.height;
@@ -71,6 +74,7 @@ impl FeaturesBuffer {
             min_distance,
             width,
             height,
+            max_features,
             &mut self.grid,
             &mut self.out,
         );
@@ -91,11 +95,11 @@ impl FeaturesBuffer {
 ///
 /// # Deprecated
 /// Use [`OpticalFlowBuilder`](crate::OpticalFlowBuilder) +
-/// [`OpticalFlowBuffer::reset_with_good_features_to_track`](crate::OpticalFlowBuffer::reset_with_good_features_to_track),
+/// [`OpticalFlowBuffer::detect_features`](crate::OpticalFlowBuffer::detect_features),
 /// which reuses pre-allocated detection buffers across calls.
 #[deprecated(
     since = "0.4.0",
-    note = "use OpticalFlowBuilder + OpticalFlowBuffer::reset_with_good_features_to_track"
+    note = "use OpticalFlowBuilder + OpticalFlowBuffer::detect_features"
 )]
 pub fn good_features_to_track(
     image: &GrayImage,
@@ -103,8 +107,9 @@ pub fn good_features_to_track(
     min_distance: u32,
 ) -> Vec<(u32, u32, f32)> {
     let (w, h) = image.dimensions();
-    let mut buf = FeaturesBuffer::with_capacity(w, h, min_distance);
-    buf.detect_into(&image.as_flat_samples(), quality_level, min_distance)
+    let max = (w as usize) * (h as usize);
+    let mut buf = FeaturesBuffer::with_capacity(w, h, min_distance, max);
+    buf.detect_into(&image.as_flat_samples(), quality_level, min_distance, max)
         .to_vec()
 }
 
@@ -217,6 +222,7 @@ fn filter_by_distance_into(
     min_distance: u32,
     width: u32,
     height: u32,
+    max_features: usize,
     grid: &mut Vec<Option<(u32, u32)>>,
     out: &mut Vec<(u32, u32, f32)>,
 ) {
@@ -232,6 +238,10 @@ fn filter_by_distance_into(
     let min_dist_sq = (min_distance * min_distance) as i32;
 
     for &(x, y, q) in features {
+        if out.len() >= max_features {
+            break;
+        }
+
         let cell_x = x / cell_size;
         let cell_y = y / cell_size;
         let mut too_close = false;

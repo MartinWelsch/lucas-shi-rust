@@ -18,6 +18,7 @@ const DEFAULT_WINDOW_SIZE: usize = 21;
 const DEFAULT_MAX_ITERATIONS: usize = 30;
 const DEFAULT_FEATURE_QUALITY_LEVEL: f32 = 0.4;
 const DEFAULT_FEATURE_MIN_DISTANCE: u32 = 10;
+const DEFAULT_MAX_FEATURES: usize = 500;
 
 /// A tracked feature point with spatial position and detection strength.
 ///
@@ -35,17 +36,17 @@ pub struct Feature {
 /// Pyramid image data plus the features associated with that frame.
 ///
 /// `features` starts empty after construction or after a `push_frame` rotation;
-/// it is populated by `good_features_to_track` or `calculate_flow`.
+/// it is populated by `detect_features` or `calculate_flow`.
 pub(crate) struct FrameBuffer {
     pyramid: PyramidBuffer,
     features: Vec<Feature>,
 }
 
 impl FrameBuffer {
-    pub(crate) fn with_capacity(width: u32, height: u32, levels: usize) -> Self {
+    pub(crate) fn with_capacity(width: u32, height: u32, levels: usize, max_features: usize) -> Self {
         Self {
             pyramid: PyramidBuffer::with_capacity(width, height, levels),
-            features: Vec::new(),
+            features: Vec::with_capacity(max_features),
         }
     }
 }
@@ -59,13 +60,14 @@ pub struct OpticalFlowBuilder {
     max_iterations: usize,
     feature_quality_level: f32,
     feature_min_distance: u32,
+    max_features: usize,
 }
 
 impl OpticalFlowBuilder {
     /// Start a builder for a fixed-resolution pipeline.
     ///
     /// Defaults: 3 pyramid levels, 21x21 window, 30 max iterations,
-    /// `quality_level = 0.4`, `min_distance = 10`.
+    /// `quality_level = 0.4`, `min_distance = 10`, `max_features = 500`.
     pub fn new(width: u32, height: u32) -> Self {
         Self {
             width,
@@ -75,6 +77,7 @@ impl OpticalFlowBuilder {
             max_iterations: DEFAULT_MAX_ITERATIONS,
             feature_quality_level: DEFAULT_FEATURE_QUALITY_LEVEL,
             feature_min_distance: DEFAULT_FEATURE_MIN_DISTANCE,
+            max_features: DEFAULT_MAX_FEATURES,
         }
     }
 
@@ -103,6 +106,11 @@ impl OpticalFlowBuilder {
         self
     }
 
+    pub fn max_features(mut self, n: usize) -> Self {
+        self.max_features = n;
+        self
+    }
+
     /// Construct the buffer, pre-allocating all internal storage.
     ///
     /// Panics if `width == 0`, `height == 0`, `pyramid_levels == 0`, or
@@ -113,8 +121,8 @@ impl OpticalFlowBuilder {
         assert!(self.pyramid_levels > 0, "pyramid_levels must be > 0");
         assert!(self.window_size % 2 == 1, "window_size must be odd");
 
-        let prev_frame = FrameBuffer::with_capacity(self.width, self.height, self.pyramid_levels);
-        let curr_frame = FrameBuffer::with_capacity(self.width, self.height, self.pyramid_levels);
+        let prev_frame = FrameBuffer::with_capacity(self.width, self.height, self.pyramid_levels, self.max_features);
+        let curr_frame = FrameBuffer::with_capacity(self.width, self.height, self.pyramid_levels, self.max_features);
         let lk_buffer = LkBuffer::with_capacity(
             self.width,
             self.height,
@@ -125,6 +133,7 @@ impl OpticalFlowBuilder {
             self.width,
             self.height,
             self.feature_min_distance,
+            self.max_features,
         );
 
         OpticalFlowBuffer {
@@ -135,11 +144,12 @@ impl OpticalFlowBuilder {
             max_iterations: self.max_iterations,
             feature_quality_level: self.feature_quality_level,
             feature_min_distance: self.feature_min_distance,
+            max_features: self.max_features,
             prev_frame,
             curr_frame,
             lk_buffer,
             features_buffer,
-            staging_positions: Vec::new(),
+            staging_positions: Vec::with_capacity(self.max_features),
             has_curr: false,
             has_prev: false,
         }
@@ -160,6 +170,7 @@ pub struct OpticalFlowBuffer {
     max_iterations: usize,
     feature_quality_level: f32,
     feature_min_distance: u32,
+    max_features: usize,
 
     prev_frame: FrameBuffer,
     curr_frame: FrameBuffer,
@@ -195,10 +206,17 @@ impl OpticalFlowBuffer {
         Ok(())
     }
 
-    /// Detect Shi-Tomasi features on the current frame and write them into
-    /// `current_features()` (cleared first). Errors `NoCurrentFrame` if no
-    /// frame has been pushed.
-    pub fn good_features_to_track(&mut self) -> Result<(), TrackError> {
+    /// Detect Shi-Tomasi corner features on the current frame.
+    ///
+    /// Writes up to [`max_features`](Self::max_features) features into
+    /// [`current_features`](Self::current_features) (cleared first), in
+    /// descending quality order. Features are filtered by
+    /// [`feature_quality_level`](Self::feature_quality_level) (relative to the
+    /// strongest corner in the frame) and spaced apart by at least
+    /// [`feature_min_distance`](Self::feature_min_distance) pixels.
+    ///
+    /// Errors [`TrackError::NoCurrentFrame`] if no frame has been pushed.
+    pub fn detect_features(&mut self) -> Result<(), TrackError> {
         if !self.has_curr {
             return Err(TrackError::NoCurrentFrame);
         }
@@ -207,6 +225,7 @@ impl OpticalFlowBuffer {
             &level0,
             self.feature_quality_level,
             self.feature_min_distance,
+            self.max_features,
         );
         self.curr_frame.features.clear();
         self.curr_frame.features.extend(
@@ -257,7 +276,7 @@ impl OpticalFlowBuffer {
 
     /// Returns the features for the most recently pushed frame.
     ///
-    /// Empty until [`good_features_to_track`](Self::good_features_to_track) or
+    /// Empty until [`detect_features`](Self::detect_features) or
     /// [`calculate_flow`](Self::calculate_flow) has been called after the last
     /// [`push_frame`](Self::push_frame).
     pub fn current_features(&self) -> &[Feature] {
@@ -273,7 +292,7 @@ impl OpticalFlowBuffer {
 
     /// Mutable view of the current frame's feature list. Callers may push,
     /// pop, retain, or modify individual entries. The next
-    /// [`good_features_to_track`](Self::good_features_to_track) or
+    /// [`detect_features`](Self::detect_features) or
     /// [`calculate_flow`](Self::calculate_flow) call will overwrite the list
     /// in place — manual edits made after one of those calls are preserved
     /// until the next call that writes the list.
@@ -325,6 +344,10 @@ impl OpticalFlowBuffer {
 
     pub fn feature_min_distance(&self) -> u32 {
         self.feature_min_distance
+    }
+
+    pub fn max_features(&self) -> usize {
+        self.max_features
     }
 }
 
@@ -432,7 +455,7 @@ mod tests {
         assert!(buf.has_current_frame());
         assert!(buf.current_features().is_empty(), "push clears current_features");
 
-        buf.good_features_to_track().unwrap();
+        buf.detect_features().unwrap();
         let n = buf.current_features().len();
         assert!(n > 0, "checkerboard yields features");
         // Strength should be non-negative.
@@ -475,10 +498,10 @@ mod tests {
     }
 
     #[test]
-    fn good_features_errors_before_any_push() {
+    fn detect_features_errors_before_any_push() {
         let mut buf = OpticalFlowBuilder::new(16, 16).build();
         assert_eq!(
-            buf.good_features_to_track(),
+            buf.detect_features(),
             Err(TrackError::NoCurrentFrame)
         );
     }
@@ -613,6 +636,7 @@ mod tests {
             .max_iterations(20)
             .feature_quality_level(0.25)
             .feature_min_distance(7)
+            .max_features(123)
             .build();
 
         assert_eq!(buf.dimensions(), (320, 240));
@@ -621,6 +645,32 @@ mod tests {
         assert_eq!(buf.max_iterations(), 20);
         assert!((buf.feature_quality_level() - 0.25).abs() < 1e-6);
         assert_eq!(buf.feature_min_distance(), 7);
+        assert_eq!(buf.max_features(), 123);
+    }
+
+    #[test]
+    fn detect_features_caps_at_max_features() {
+        const W: u32 = 64;
+        const H: u32 = 64;
+        let frame = checkerboard(W, H, 4); // small cells → many features
+
+        let mut buf = OpticalFlowBuilder::new(W, H)
+            .pyramid_levels(2)
+            .feature_min_distance(2)
+            .feature_quality_level(0.01)
+            .max_features(10)
+            .build();
+
+        buf.push_frame(&make_view(&frame, W, H)).unwrap();
+        buf.detect_features().unwrap();
+
+        assert!(
+            buf.current_features().len() <= 10,
+            "detect_features should respect max_features (got {})",
+            buf.current_features().len()
+        );
+        // With a fine-grained checkerboard we expect at least a few features.
+        assert!(!buf.current_features().is_empty());
     }
 
     #[test]

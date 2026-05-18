@@ -96,7 +96,7 @@ fn buffer_path_is_steady_state_zero_alloc() {
     //   4. calculate_flow fills curr.features.
     //   5. Additional cycles stabilize internal Vecs.
     buf.push_frame(&make_view(&frame_a, W, H)).unwrap();
-    buf.good_features_to_track().unwrap();
+    buf.detect_features().unwrap();
     buf.push_frame(&make_view(&frame_b, W, H)).unwrap();
     buf.calculate_flow().unwrap();
     buf.push_frame(&make_view(&frame_a, W, H)).unwrap();
@@ -121,7 +121,7 @@ fn buffer_path_is_steady_state_zero_alloc() {
 }
 
 #[test]
-fn buffer_path_good_features_to_track_is_zero_alloc_after_warmup() {
+fn buffer_path_detect_features_is_zero_alloc_after_warmup() {
     const W: u32 = 256;
     const H: u32 = 256;
     let frame = checkerboard(W, H, 8);
@@ -130,18 +130,18 @@ fn buffer_path_good_features_to_track_is_zero_alloc_after_warmup() {
     let mut buf = OpticalFlowBuilder::new(W, H).build();
     buf.push_frame(&view).unwrap();
     // Warm-up: the first detect may grow curr.features to its steady size.
-    buf.good_features_to_track().unwrap();
-    buf.good_features_to_track().unwrap();
+    buf.detect_features().unwrap();
+    buf.detect_features().unwrap();
 
     let n_alloc = measure(|| {
         for _ in 0..5 {
-            buf.good_features_to_track().unwrap();
+            buf.detect_features().unwrap();
         }
     });
 
     assert_eq!(
         n_alloc, 0,
-        "good_features_to_track allocated {n_alloc} times in 5 calls \
+        "detect_features allocated {n_alloc} times in 5 calls \
          after warm-up; expected 0."
     );
 }
