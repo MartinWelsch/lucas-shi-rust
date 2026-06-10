@@ -121,6 +121,44 @@ fn tracker_steady_state_zero_alloc() {
 }
 
 #[test]
+fn tracker_calculate_flow_fb_zero_alloc() {
+    const W: u32 = 256;
+    const H: u32 = 256;
+
+    let frame_a = checkerboard(W, H, 8);
+    let frame_b: Vec<u8> = frame_a.iter().map(|p| p.wrapping_add(2)).collect();
+
+    let mut tracker: OpticalFlowTracker = OpticalFlowBuilder::new(W, H).build();
+    let mut valid: Vec<bool> = Vec::new();
+
+    // Warm-up: prime pyramids + features, and let the FB scratch Vecs grow
+    // to their steady-state size (including `valid`).
+    tracker.push_frame(&make_view(&frame_a, W, H)).unwrap();
+    tracker.detect_features().unwrap();
+    tracker.push_frame(&make_view(&frame_b, W, H)).unwrap();
+    tracker.calculate_flow_fb(2.0, &mut valid).unwrap();
+    tracker.push_frame(&make_view(&frame_a, W, H)).unwrap();
+    tracker.calculate_flow_fb(2.0, &mut valid).unwrap();
+    tracker.push_frame(&make_view(&frame_b, W, H)).unwrap();
+    tracker.calculate_flow_fb(2.0, &mut valid).unwrap();
+
+    let n_alloc = measure(|| {
+        for _ in 0..10 {
+            tracker.push_frame(&make_view(&frame_a, W, H)).unwrap();
+            tracker.calculate_flow_fb(2.0, &mut valid).unwrap();
+            tracker.push_frame(&make_view(&frame_b, W, H)).unwrap();
+            tracker.calculate_flow_fb(2.0, &mut valid).unwrap();
+        }
+    });
+
+    assert_eq!(
+        n_alloc, 0,
+        "calculate_flow_fb steady-state allocated {n_alloc} times in 20 frames \
+         after warm-up; expected 0."
+    );
+}
+
+#[test]
 fn tracker_detect_features_is_zero_alloc_after_warmup() {
     const W: u32 = 256;
     const H: u32 = 256;

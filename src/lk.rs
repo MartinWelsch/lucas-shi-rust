@@ -57,6 +57,30 @@ impl LkBuffer {
         features: &mut [Feature],
         max_iterations: usize,
     ) {
+        self.calc_into_status(prev_pyramid, curr_pyramid, features, max_iterations, None);
+    }
+
+    /// Like [`calc_into`](Self::calc_into) but additionally reports, per
+    /// feature, whether Lucas-Kanade actually produced a flow estimate for
+    /// it. A feature is reported **invalid** (`false`) when it was *skipped*
+    /// at the coarsest pyramid level — either its window fell outside the
+    /// previous image (`in_bounds` failed) or its gradient Hessian was
+    /// singular. Such a feature keeps displacement `(0, 0)` and is exactly
+    /// the kind of "stuck" feature forward-backward validation must reject.
+    /// All other features are reported valid (`true`); the caller is
+    /// responsible for the round-trip error gate.
+    ///
+    /// `valid_out`, when `Some`, is cleared and resized to `features.len()`.
+    /// Passing `None` skips status bookkeeping entirely (the plain
+    /// `calc_into` path).
+    pub(crate) fn calc_into_status(
+        &mut self,
+        prev_pyramid: &[GrayImage],
+        curr_pyramid: &[GrayImage],
+        features: &mut [Feature],
+        max_iterations: usize,
+        mut valid_out: Option<&mut Vec<bool>>,
+    ) {
         assert_eq!(prev_pyramid.len(), curr_pyramid.len());
 
         let n_levels = prev_pyramid.len();
@@ -66,6 +90,17 @@ impl LkBuffer {
 
         self.displacements.clear();
         self.displacements.resize(features.len(), (0.0, 0.0));
+
+        if let Some(valid) = valid_out.as_deref_mut() {
+            valid.clear();
+            // A feature is valid only if it produced a flow estimate at the
+            // coarsest level. Start all-false; the coarsest-level pass flips
+            // surviving features to true.
+            valid.resize(features.len(), false);
+        }
+        // The coarsest level drives the validity decision: a feature skipped
+        // there never enters tracking at all and stays at (0, 0).
+        let coarsest = n_levels - 1;
 
         for level in (0..n_levels).rev() {
             let scale = 2f32.powi(level as i32);
@@ -78,7 +113,11 @@ impl LkBuffer {
                 &mut self.grad_y[level],
             );
 
-            for (feat, disp) in features.iter().zip(self.displacements.iter_mut()) {
+            for (fi, (feat, disp)) in features
+                .iter()
+                .zip(self.displacements.iter_mut())
+                .enumerate()
+            {
                 let x = feat.x / scale;
                 let y = feat.y / scale;
                 let mut dx = disp.0 / scale;
@@ -109,6 +148,14 @@ impl LkBuffer {
                 let Some((inv_h00, inv_h01, inv_h11)) = invert_2x2(gxx, gxy, gyy, det_epsilon) else {
                     continue;
                 };
+
+                // Reached tracking at the coarsest level ⇒ this feature has a
+                // genuine flow estimate (not a stuck (0, 0)).
+                if level == coarsest
+                    && let Some(valid) = valid_out.as_deref_mut()
+                {
+                    valid[fi] = true;
+                }
 
                 for _ in 0..max_iterations {
                     let curr_x = x + dx;

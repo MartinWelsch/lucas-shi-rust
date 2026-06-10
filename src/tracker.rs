@@ -145,6 +145,10 @@ impl OpticalFlowBuilder {
             features: Vec::with_capacity(self.max_features),
             lk_buffer,
             features_buffer,
+            fb_origin: Vec::with_capacity(self.max_features),
+            fb_back: Vec::with_capacity(self.max_features),
+            fb_fwd_valid: Vec::with_capacity(self.max_features),
+            fb_back_valid: Vec::with_capacity(self.max_features),
             frame_count: 0,
         }
     }
@@ -176,6 +180,13 @@ pub struct OpticalFlowTracker {
     features: Vec<Feature>,
     lk_buffer: LkBuffer,
     features_buffer: FeaturesBuffer,
+
+    // Reusable scratch for forward-backward validation. All pre-grown to
+    // `max_features` so `calculate_flow_fb` allocates nothing after warm-up.
+    fb_origin: Vec<(f32, f32)>,
+    fb_back: Vec<Feature>,
+    fb_fwd_valid: Vec<bool>,
+    fb_back_valid: Vec<bool>,
 
     frame_count: u64,
 }
@@ -236,6 +247,84 @@ impl OpticalFlowTracker {
             &mut self.features,
             self.max_iterations,
         );
+
+        Ok(())
+    }
+
+    /// Forward-backward validated optical flow.
+    ///
+    /// Runs the forward pass exactly like
+    /// [`calculate_flow`](Self::calculate_flow) (each `Feature`'s position
+    /// is advanced into the just-pushed frame, in place), then tracks every
+    /// feature *backward* from its new position into the previous frame and
+    /// measures the round-trip distance to where it started. A feature is
+    /// reported **invalid** when any of the following holds:
+    ///
+    /// * the forward pass skipped it (window out of bounds / singular
+    ///   Hessian) — it never actually moved and is stuck at `(0, 0)`;
+    /// * the backward pass skipped it for the same reasons;
+    /// * the round-trip error exceeds `max_fb_error` pixels.
+    ///
+    /// This method does **not** prune `features`. Instead it writes a
+    /// per-feature validity mask into `valid_out` (cleared then resized to
+    /// `features().len()`, index-aligned with `features()`), leaving the
+    /// caller to drop invalid entries while keeping any parallel snapshot
+    /// (e.g. previous-frame positions) aligned. The forward positions are
+    /// retained in `features` regardless of validity.
+    ///
+    /// Errors [`TrackError::NoPreviousFrame`] if fewer than two frames have
+    /// been pushed. No heap allocation after warm-up (all scratch is
+    /// pre-grown to `max_features`).
+    pub fn calculate_flow_fb(
+        &mut self,
+        max_fb_error: f32,
+        valid_out: &mut Vec<bool>,
+    ) -> Result<(), TrackError> {
+        if self.frame_count < 2 {
+            return Err(TrackError::NoPreviousFrame);
+        }
+
+        // Snapshot original (previous-frame) positions for the round trip.
+        self.fb_origin.clear();
+        self.fb_origin
+            .extend(self.features.iter().map(|f| (f.x, f.y)));
+
+        // Forward pass: prev -> curr, capturing per-feature validity.
+        self.lk_buffer.calc_into_status(
+            self.prev_pyramid.levels(),
+            self.curr_pyramid.levels(),
+            &mut self.features,
+            self.max_iterations,
+            Some(&mut self.fb_fwd_valid),
+        );
+
+        // Backward pass: curr -> prev, starting from the forward result.
+        self.fb_back.clear();
+        self.fb_back.extend(self.features.iter().copied());
+        self.lk_buffer.calc_into_status(
+            self.curr_pyramid.levels(),
+            self.prev_pyramid.levels(),
+            &mut self.fb_back,
+            self.max_iterations,
+            Some(&mut self.fb_back_valid),
+        );
+
+        // Round-trip gate.
+        let max_err2 = max_fb_error * max_fb_error;
+        valid_out.clear();
+        valid_out.resize(self.features.len(), false);
+        // Index loop: walks five parallel buffers in lockstep.
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..self.features.len() {
+            let fwd_ok = self.fb_fwd_valid[i];
+            let back_ok = self.fb_back_valid[i];
+            let (ox, oy) = self.fb_origin[i];
+            let back = self.fb_back[i];
+            let ex = back.x - ox;
+            let ey = back.y - oy;
+            let err2 = ex * ex + ey * ey;
+            valid_out[i] = fwd_ok && back_ok && err2 <= max_err2;
+        }
 
         Ok(())
     }
