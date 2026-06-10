@@ -9,7 +9,7 @@ use std::cell::Cell;
 use std::sync::Mutex;
 
 use image::flat::{FlatSamples, SampleLayout};
-use optical_flow_lk::OpticalFlowBuilder;
+use optical_flow_lk::{OpticalFlowBuilder, OpticalFlowTracker};
 
 struct CountingAllocator;
 
@@ -80,62 +80,62 @@ fn checkerboard(width: u32, height: u32, cell: u32) -> Vec<u8> {
 // ----- Strict zero-allocation assertion for the buffer path -----
 
 #[test]
-fn buffer_path_is_steady_state_zero_alloc() {
+fn tracker_steady_state_zero_alloc() {
     const W: u32 = 256;
     const H: u32 = 256;
 
     let frame_a = checkerboard(W, H, 8);
     let frame_b: Vec<u8> = frame_a.iter().map(|p| p.wrapping_add(2)).collect();
 
-    let mut buf = OpticalFlowBuilder::new(W, H).build();
+    let mut tracker: OpticalFlowTracker = OpticalFlowBuilder::new(W, H).build();
 
     // Warm-up:
     //   1. push primes curr.
-    //   2. detect populates curr.features to its steady-state size.
+    //   2. detect populates features to its steady-state size.
     //   3. push rotates so prev = a, curr = b.
-    //   4. calculate_flow fills curr.features.
+    //   4. calculate_flow mutates features in place.
     //   5. Additional cycles stabilize internal Vecs.
-    buf.push_frame(&make_view(&frame_a, W, H)).unwrap();
-    buf.detect_features().unwrap();
-    buf.push_frame(&make_view(&frame_b, W, H)).unwrap();
-    buf.calculate_flow().unwrap();
-    buf.push_frame(&make_view(&frame_a, W, H)).unwrap();
-    buf.calculate_flow().unwrap();
-    buf.push_frame(&make_view(&frame_b, W, H)).unwrap();
-    buf.calculate_flow().unwrap();
+    tracker.push_frame(&make_view(&frame_a, W, H)).unwrap();
+    tracker.detect_features().unwrap();
+    tracker.push_frame(&make_view(&frame_b, W, H)).unwrap();
+    tracker.calculate_flow().unwrap();
+    tracker.push_frame(&make_view(&frame_a, W, H)).unwrap();
+    tracker.calculate_flow().unwrap();
+    tracker.push_frame(&make_view(&frame_b, W, H)).unwrap();
+    tracker.calculate_flow().unwrap();
 
     let n_alloc = measure(|| {
         for _ in 0..10 {
-            buf.push_frame(&make_view(&frame_a, W, H)).unwrap();
-            buf.calculate_flow().unwrap();
-            buf.push_frame(&make_view(&frame_b, W, H)).unwrap();
-            buf.calculate_flow().unwrap();
+            tracker.push_frame(&make_view(&frame_a, W, H)).unwrap();
+            tracker.calculate_flow().unwrap();
+            tracker.push_frame(&make_view(&frame_b, W, H)).unwrap();
+            tracker.calculate_flow().unwrap();
         }
     });
 
     assert_eq!(
         n_alloc, 0,
-        "OpticalFlowBuffer steady-state allocated {n_alloc} times in 20 frames \
+        "OpticalFlowTracker steady-state allocated {n_alloc} times in 20 frames \
          after warm-up; expected 0."
     );
 }
 
 #[test]
-fn buffer_path_detect_features_is_zero_alloc_after_warmup() {
+fn tracker_detect_features_is_zero_alloc_after_warmup() {
     const W: u32 = 256;
     const H: u32 = 256;
     let frame = checkerboard(W, H, 8);
     let view = make_view(&frame, W, H);
 
-    let mut buf = OpticalFlowBuilder::new(W, H).build();
-    buf.push_frame(&view).unwrap();
-    // Warm-up: the first detect may grow curr.features to its steady size.
-    buf.detect_features().unwrap();
-    buf.detect_features().unwrap();
+    let mut tracker = OpticalFlowBuilder::new(W, H).build();
+    tracker.push_frame(&view).unwrap();
+    // Warm-up: the first detect may grow features to its steady size.
+    tracker.detect_features().unwrap();
+    tracker.detect_features().unwrap();
 
     let n_alloc = measure(|| {
         for _ in 0..5 {
-            buf.detect_features().unwrap();
+            tracker.detect_features().unwrap();
         }
     });
 

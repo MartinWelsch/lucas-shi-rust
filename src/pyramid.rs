@@ -6,7 +6,7 @@ use image::{GrayImage, ImageBuffer, Luma};
 /// level halves both dimensions. The loop stops early if a halving
 /// would produce a level with either dimension < 2 — the returned Vec
 /// then has fewer entries than `levels`.
-pub(crate) fn pyramid_dims(width: u32, height: u32, levels: usize) -> Vec<(u32, u32)> {
+pub fn pyramid_dims(width: u32, height: u32, levels: usize) -> Vec<(u32, u32)> {
     let mut dims = Vec::with_capacity(levels);
     let mut w = width;
     let mut h = height;
@@ -24,8 +24,9 @@ pub(crate) fn pyramid_dims(width: u32, height: u32, levels: usize) -> Vec<(u32, 
 }
 
 /// Reusable pyramid storage. Pre-allocates every level at construction;
-/// `build_into` overwrites the existing buffers from a new source view.
-pub(crate) struct PyramidBuffer {
+/// [`build_pyramid`](crate::buffers::build_pyramid) overwrites the existing
+/// buffers from a new source view.
+pub struct PyramidBuffer {
     levels: Vec<GrayImage>,
 }
 
@@ -33,7 +34,7 @@ impl PyramidBuffer {
     /// Allocate `levels` images sized `(width, height), (width/2, height/2), ...`.
     /// If a halving brings either dimension below 2, no further levels are allocated
     /// (matches the legacy `build_pyramid` early-exit behavior).
-    pub(crate) fn with_capacity(width: u32, height: u32, levels: usize) -> Self {
+    pub fn with_capacity(width: u32, height: u32, levels: usize) -> Self {
         let images = pyramid_dims(width, height, levels)
             .into_iter()
             .map(|(w, h)| ImageBuffer::new(w, h))
@@ -90,7 +91,8 @@ impl PyramidBuffer {
         }
     }
 
-    pub(crate) fn levels(&self) -> &[GrayImage] {
+    /// Borrow the pre-allocated pyramid levels (level 0 first, full resolution).
+    pub fn levels(&self) -> &[GrayImage] {
         &self.levels
     }
 
@@ -114,11 +116,11 @@ impl PyramidBuffer {
 ///
 /// # Deprecated
 /// Use [`OpticalFlowBuilder`](crate::OpticalFlowBuilder) +
-/// [`OpticalFlowBuffer`](crate::OpticalFlowBuffer); the pyramid is built
+/// [`OpticalFlowTracker`](crate::OpticalFlowTracker); the pyramid is built
 /// internally by `push_frame` with zero per-frame allocations after warm-up.
 #[deprecated(
     since = "0.4.0",
-    note = "use OpticalFlowBuilder + OpticalFlowBuffer; the pyramid is built internally by push_frame"
+    note = "use OpticalFlowBuilder + OpticalFlowTracker; the pyramid is built internally by push_frame"
 )]
 pub fn build_pyramid(image: &GrayImage, levels: usize) -> Vec<GrayImage> {
     let (w, h) = image.dimensions();

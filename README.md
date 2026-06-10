@@ -19,46 +19,52 @@ Add to your `Cargo.toml`:
 optical-flow-lk = "0.4"
 ```
 
-## Quick start
+## Quick start — `OpticalFlowTracker`
 
 ```rust
 use optical_flow_lk::OpticalFlowBuilder;
 
-let mut buf = OpticalFlowBuilder::new(width, height)
+let mut tracker = OpticalFlowBuilder::new(width, height)
     .pyramid_levels(4)
     .window_size(21)
     .max_iterations(30)
     .feature_quality_level(0.1)
     .feature_min_distance(5)
-    .max_features(300)  // cap detection output (default: 500)
+    .max_features(300)
     .build();
 
-// Prime the pipeline with the first frame and detect features on it.
-buf.push_frame(&first_frame_view)?;
-buf.detect_features()?;
+// Push the first frame and detect features on it.
+tracker.push_frame(&first_frame.as_flat_samples())?;
+tracker.detect_features()?;
 
 // Track those features through subsequent frames.
-for frame_view in frames {
-    buf.push_frame(&frame_view)?;
-    buf.calculate_flow()?;
-    for &feature in buf.current_features() {
+for frame in frames {
+    tracker.push_frame(&frame.as_flat_samples())?;
+    tracker.calculate_flow()?;
+    for &feature in tracker.features() {
         // feature.x, feature.y, feature.strength
     }
 }
 ```
 
+`features()` returns a single feature list that describes positions in the
+most recently consumed frame. `push_frame` does not touch it; the next
+`calculate_flow()` mutates the positions in place from the previous frame
+into the just-pushed one. After warm-up, no method on the tracker
+allocates.
+
 ## Zero-copy input — subrect or NV12 Y plane
 
-`OpticalFlowBuffer::push_frame` accepts any `&FlatSamples<B>` matching the
-buffer's configured resolution. Subrects of larger images and NV12 Y planes
-(possibly with row padding) are zero-copy.
+`OpticalFlowTracker::push_frame` accepts any `&FlatSamples<B>` matching the
+tracker's configured resolution. Subrects of larger images and NV12 Y
+planes (possibly with row padding) are zero-copy.
 
 ### Subrect of a larger `GrayImage`
 
 ```rust
 use optical_flow_lk::{FlatSamples, OpticalFlowBuilder, SampleLayout};
 
-let mut buf = OpticalFlowBuilder::new(w, h).build();
+let mut tracker = OpticalFlowBuilder::new(w, h).build();
 
 let stride = big.width() as usize;
 let off = oy as usize * stride + ox as usize;
@@ -71,7 +77,7 @@ let view = FlatSamples {
     },
     color_hint: None,
 };
-buf.push_frame(&view)?;
+tracker.push_frame(&view)?;
 ```
 
 ### NV12 Y plane (full or subrect)
@@ -79,7 +85,7 @@ buf.push_frame(&view)?;
 ```rust
 use optical_flow_lk::{FlatSamples, OpticalFlowBuilder, SampleLayout};
 
-let mut buf = OpticalFlowBuilder::new(width, height).build();
+let mut tracker = OpticalFlowBuilder::new(width, height).build();
 let view = FlatSamples {
     samples: &nv12_buffer[..],
     layout: SampleLayout {
@@ -89,23 +95,40 @@ let view = FlatSamples {
     },
     color_hint: None,
 };
-buf.push_frame(&view)?;
+tracker.push_frame(&view)?;
 ```
 
 `push_frame` returns `Err(TrackError::Layout(LayoutError::…))` if the
-`FlatSamples` layout cannot be safely consumed — see [`TrackError`] /
-[`LayoutError`].
+`FlatSamples` layout cannot be safely consumed.
 
-## Real-time tracking — `OpticalFlowBuffer`
+## Manual pipeline — `buffers` module
 
-After the initial warm-up `OpticalFlowBuffer` performs zero heap allocations
-per frame. `push_frame` accepts any `&FlatSamples<B>` matching the configured
-resolution, so subrects of larger images and NV12 Y planes are zero-copy.
+When `OpticalFlowTracker` doesn't fit (e.g., sharing one pyramid across
+multiple LK runs, keeping more than two pyramids in memory, or running
+detection without a tracker), use the building blocks directly:
 
-Feature buffers are owned by the pipeline and are accessible via
-`current_features()` and `previous_features()`. Each `Feature` carries its
-spatial position and its Shi-Tomasi strength through tracking.
+```rust
+use optical_flow_lk::Feature;
+use optical_flow_lk::buffers::{
+    FeaturesBuffer, LkBuffer, PyramidBuffer,
+    build_pyramid, detect_features, track,
+};
 
-Re-detect features at any time by calling `detect_features()` after a
-`push_frame`. The next `calculate_flow()` call will track whatever features
-are in the previous frame buffer.
+let (w, h, levels, window, max_features) = (640, 480, 3, 21, 500);
+
+let mut prev_pyr = PyramidBuffer::with_capacity(w, h, levels);
+let mut curr_pyr = PyramidBuffer::with_capacity(w, h, levels);
+let mut lk = LkBuffer::with_capacity(w, h, levels, window, max_features);
+let mut fb = FeaturesBuffer::with_capacity(w, h, /* min_distance */ 5, max_features);
+let mut features: Vec<Feature> = Vec::with_capacity(max_features);
+
+build_pyramid(&mut curr_pyr, &first_frame.as_flat_samples())?;
+detect_features(&mut fb, &curr_pyr, 0.1, 5, max_features, &mut features);
+
+for frame in frames {
+    std::mem::swap(&mut prev_pyr, &mut curr_pyr);
+    build_pyramid(&mut curr_pyr, &frame.as_flat_samples())?;
+    track(&mut lk, &prev_pyr, &curr_pyr, &mut features, 30);
+    // features now hold positions in `frame`.
+}
+```

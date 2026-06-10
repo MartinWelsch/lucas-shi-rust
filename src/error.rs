@@ -42,11 +42,12 @@ mod tests {
     }
 }
 
-/// Errors returned by [`OpticalFlowBuffer`] operations.
+/// Errors returned by [`OpticalFlowTracker`](crate::OpticalFlowTracker)
+/// operations and the [`buffers`](crate::buffers) free functions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrackError {
-    /// The provided `FlatSamples` failed the layout checks performed by
-    /// [`OpticalFlowBuffer::push_frame`] — channels, stride, buffer length.
+    /// The provided `FlatSamples` failed the layout checks (channels,
+    /// stride, buffer length).
     Layout(LayoutError),
 
     /// `image.layout.width` or `.height` did not match the buffer's

@@ -2,11 +2,13 @@ use image::flat::FlatSamples;
 use image::{GrayImage, ImageBuffer, Luma};
 use std::cmp::Ordering;
 
+use crate::feature::Feature;
 use crate::utils::{box_filter_3x3::box_filter_3x3_in_place, fast_gradients::compute_gradients_into};
 
 /// Reusable storage for Shi-Tomasi feature detection. Pre-allocates every
-/// per-call buffer at construction; `detect_into` reuses them.
-pub(crate) struct FeaturesBuffer {
+/// per-call buffer at construction;
+/// [`detect_features`](crate::buffers::detect_features) reuses them.
+pub struct FeaturesBuffer {
     gx: ImageBuffer<Luma<i16>, Vec<i16>>,
     gy: ImageBuffer<Luma<i16>, Vec<i16>>,
     ix_sq: ImageBuffer<Luma<i16>, Vec<i16>>,
@@ -15,14 +17,12 @@ pub(crate) struct FeaturesBuffer {
     features: Vec<(u32, u32, f32)>,
     is_local_max: Vec<bool>,
     grid: Vec<Option<(u32, u32)>>,
-    out: Vec<(u32, u32, f32)>,
 }
 
 impl FeaturesBuffer {
     /// Pre-allocate every buffer using best-effort upper bounds derived from
-    /// the configured resolution and `min_distance`. `max_features` caps the
-    /// capacity of the `out` Vec (and the short-circuit in `detect_into`).
-    pub(crate) fn with_capacity(width: u32, height: u32, min_distance: u32, max_features: usize) -> Self {
+    /// the configured resolution and `min_distance`.
+    pub fn with_capacity(width: u32, height: u32, min_distance: u32, _max_features: usize) -> Self {
         let pixels = (width as usize) * (height as usize);
         let cell_size = min_distance.max(1);
         let grid_width = width.div_ceil(cell_size);
@@ -38,22 +38,21 @@ impl FeaturesBuffer {
             features: Vec::with_capacity(pixels),
             is_local_max: vec![false; pixels],
             grid: vec![None; cells],
-            out: Vec::with_capacity(max_features),
         }
     }
 
-    /// Detect Shi-Tomasi features on `image`, returning a slice of
-    /// `(x, y, min_eigenvalue)` triples filtered by quality and distance.
-    /// The returned slice borrows from `self.out`. No heap allocation when
-    /// the buffer was sized for the same resolution and min_distance.
-    /// At most `max_features` entries are returned (top-quality first).
+    /// Detect Shi-Tomasi features on `image`, writing up to `max_features`
+    /// `Feature` entries into `out` (cleared first), in descending quality
+    /// order. No heap allocation when the buffer was sized for the same
+    /// resolution and `min_distance`, and `out` has enough capacity.
     pub(crate) fn detect_into(
         &mut self,
         image: &FlatSamples<&[u8]>,
         quality_level: f32,
         min_distance: u32,
         max_features: usize,
-    ) -> &[(u32, u32, f32)] {
+        out: &mut Vec<Feature>,
+    ) {
         let width = image.layout.width;
         let height = image.layout.height;
 
@@ -76,10 +75,8 @@ impl FeaturesBuffer {
             height,
             max_features,
             &mut self.grid,
-            &mut self.out,
+            out,
         );
-
-        &self.out
     }
 }
 
@@ -95,11 +92,11 @@ impl FeaturesBuffer {
 ///
 /// # Deprecated
 /// Use [`OpticalFlowBuilder`](crate::OpticalFlowBuilder) +
-/// [`OpticalFlowBuffer::detect_features`](crate::OpticalFlowBuffer::detect_features),
+/// [`OpticalFlowTracker::detect_features`](crate::OpticalFlowTracker::detect_features),
 /// which reuses pre-allocated detection buffers across calls.
 #[deprecated(
     since = "0.4.0",
-    note = "use OpticalFlowBuilder + OpticalFlowBuffer::detect_features"
+    note = "use OpticalFlowBuilder + OpticalFlowTracker::detect_features"
 )]
 pub fn good_features_to_track(
     image: &GrayImage,
@@ -109,8 +106,9 @@ pub fn good_features_to_track(
     let (w, h) = image.dimensions();
     let max = (w as usize) * (h as usize);
     let mut buf = FeaturesBuffer::with_capacity(w, h, min_distance, max);
-    buf.detect_into(&image.as_flat_samples(), quality_level, min_distance, max)
-        .to_vec()
+    let mut out: Vec<Feature> = Vec::with_capacity(max);
+    buf.detect_into(&image.as_flat_samples(), quality_level, min_distance, max, &mut out);
+    out.into_iter().map(|f| (f.x as u32, f.y as u32, f.strength)).collect()
 }
 
 fn compute_gradient_products_into(
@@ -224,7 +222,7 @@ fn filter_by_distance_into(
     height: u32,
     max_features: usize,
     grid: &mut Vec<Option<(u32, u32)>>,
-    out: &mut Vec<(u32, u32, f32)>,
+    out: &mut Vec<Feature>,
 ) {
     let cell_size = min_distance.max(1);
     let grid_width = width.div_ceil(cell_size);
@@ -277,7 +275,7 @@ fn filter_by_distance_into(
         if !too_close {
             let cell_idx = (cell_y * grid_width + cell_x) as usize;
             grid[cell_idx] = Some((x, y));
-            out.push((x, y, q));
+            out.push(Feature { x: x as f32, y: y as f32, strength: q });
         }
     }
 }
