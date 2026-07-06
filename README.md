@@ -53,6 +53,14 @@ most recently consumed frame. `push_frame` does not touch it; the next
 into the just-pushed one. After warm-up, no method on the tracker
 allocates.
 
+`detect_features_in_rect(x, y, w, h)` bounds detection to a rectangle of
+the frame: the relative quality threshold, min-distance grid, and
+`max_features` budget all become local to the rect (output coordinates
+stay in full-frame space). Use it when a busy background would otherwise
+crowd a region of interest out of the candidate pool. Detection scratch
+buffers resize when the rect's dimensions change; steady-state calls with
+a stable rect allocate nothing.
+
 ## Zero-copy input — subrect or NV12 Y plane
 
 `OpticalFlowTracker::push_frame` accepts any `&FlatSamples<B>` matching the
