@@ -231,6 +231,73 @@ impl OpticalFlowTracker {
         Ok(())
     }
 
+    /// Like [`detect_features`](Self::detect_features) but bounded to the
+    /// rectangle `(x, y, w, h)` of the most recently pushed frame.
+    ///
+    /// Detection runs on a strided subrect view, so ALL of the detector's
+    /// budgets become local to the rect: the relative quality threshold is
+    /// a fraction of the strongest corner *inside the rect* (not of some
+    /// stronger corner elsewhere in the frame), and the min-distance grid
+    /// and `max_features` cap are spent inside the rect only. Use this
+    /// when a busy background would otherwise crowd a region of interest
+    /// out of the candidate pool.
+    ///
+    /// Output coordinates are in full-frame space. Corners within the
+    /// gradient border (1 px) of the rect edge are not detected — the same
+    /// border rule the full-frame path has at the frame edge.
+    ///
+    /// Errors [`TrackError::NoCurrentFrame`] before the first push, and
+    /// [`TrackError::RectOutOfBounds`] for an empty or out-of-bounds rect.
+    pub fn detect_features_in_rect(
+        &mut self,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<(), TrackError> {
+        if self.frame_count == 0 {
+            return Err(TrackError::NoCurrentFrame);
+        }
+        let oob = w == 0
+            || h == 0
+            || x.checked_add(w).map(|xe| xe > self.width).unwrap_or(true)
+            || y.checked_add(h).map(|ye| ye > self.height).unwrap_or(true);
+        if oob {
+            return Err(TrackError::RectOutOfBounds {
+                rect: (x, y, w, h),
+                frame: (self.width, self.height),
+            });
+        }
+
+        let level0 = &self.curr_pyramid.levels()[0];
+        let stride = self.width as usize;
+        let offset = y as usize * stride + x as usize;
+        let view: FlatSamples<&[u8]> = FlatSamples {
+            samples: &level0.as_raw()[offset..],
+            layout: image::flat::SampleLayout {
+                channels: 1,
+                channel_stride: 1,
+                width: w,
+                width_stride: 1,
+                height: h,
+                height_stride: stride,
+            },
+            color_hint: None,
+        };
+        self.features_buffer.detect_into(
+            &view,
+            self.feature_quality_level,
+            self.feature_min_distance,
+            self.max_features,
+            &mut self.features,
+        );
+        for f in &mut self.features {
+            f.x += x as f32;
+            f.y += y as f32;
+        }
+        Ok(())
+    }
+
     /// Track [`features`](Self::features) from the previous frame into the
     /// most recently pushed frame using Lucas-Kanade, updating each
     /// `Feature`'s position in place. `strength` is left untouched.
@@ -638,6 +705,75 @@ mod tests {
 
         assert!(tracker.features().len() <= 10);
         assert!(!tracker.features().is_empty());
+    }
+
+    /// Rect-bounded detection: features land only inside the rect, in
+    /// full-frame coordinates, and the quality threshold is local — weak
+    /// in-rect corners are found even when far stronger corners exist
+    /// outside the rect (which would push them under a frame-global
+    /// relative threshold).
+    #[test]
+    fn detect_features_in_rect_bounds_and_local_quality() {
+        const W: u32 = 96;
+        const H: u32 = 96;
+        // Weak texture inside the rect: checkerboard with low contrast.
+        let mut frame = vec![128u8; (W * H) as usize];
+        for y in 40..80u32 {
+            for x in 40..80u32 {
+                let on = ((x / 4) + (y / 4)) % 2 == 0;
+                frame[(y * W + x) as usize] = if on { 140 } else { 116 };
+            }
+        }
+        // Very strong corners OUTSIDE the rect (max-contrast checkerboard).
+        for y in 0..24u32 {
+            for x in 0..24u32 {
+                let on = ((x / 4) + (y / 4)) % 2 == 0;
+                frame[(y * W + x) as usize] = if on { 255 } else { 0 };
+            }
+        }
+
+        let mut tracker = OpticalFlowBuilder::new(W, H)
+            .pyramid_levels(2)
+            .feature_min_distance(2)
+            .feature_quality_level(0.1)
+            .build();
+        tracker.push_frame(&make_view(&frame, W, H)).unwrap();
+
+        tracker.detect_features_in_rect(36, 36, 48, 48).unwrap();
+        assert!(
+            !tracker.features().is_empty(),
+            "low-contrast in-rect corners must pass the rect-local quality bar"
+        );
+        for f in tracker.features() {
+            assert!(
+                (36.0..84.0).contains(&f.x) && (36.0..84.0).contains(&f.y),
+                "feature ({}, {}) outside the detection rect",
+                f.x,
+                f.y
+            );
+        }
+    }
+
+    #[test]
+    fn detect_features_in_rect_rejects_bad_rects() {
+        let mut tracker = OpticalFlowBuilder::new(32, 32).build();
+        let frame = vec![0u8; 32 * 32];
+
+        assert_eq!(
+            tracker.detect_features_in_rect(0, 0, 16, 16),
+            Err(TrackError::NoCurrentFrame)
+        );
+
+        tracker.push_frame(&make_view(&frame, 32, 32)).unwrap();
+        assert_eq!(
+            tracker.detect_features_in_rect(0, 0, 0, 16),
+            Err(TrackError::RectOutOfBounds { rect: (0, 0, 0, 16), frame: (32, 32) })
+        );
+        assert_eq!(
+            tracker.detect_features_in_rect(20, 0, 16, 16),
+            Err(TrackError::RectOutOfBounds { rect: (20, 0, 16, 16), frame: (32, 32) })
+        );
+        assert!(tracker.detect_features_in_rect(16, 16, 16, 16).is_ok());
     }
 
     #[test]

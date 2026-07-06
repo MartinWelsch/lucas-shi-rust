@@ -61,6 +61,13 @@ pub enum TrackError {
     /// `detect_features` was called before any frame had been pushed,
     /// so there is nothing to detect features on.
     NoCurrentFrame,
+
+    /// `detect_features_in_rect` was called with a rectangle that is empty
+    /// or does not fit inside the configured frame.
+    RectOutOfBounds {
+        rect: (u32, u32, u32, u32),
+        frame: (u32, u32),
+    },
 }
 
 impl From<LayoutError> for TrackError {
@@ -82,6 +89,11 @@ impl std::fmt::Display for TrackError {
                 write!(f, "no previous frame pushed yet"),
             TrackError::NoCurrentFrame =>
                 write!(f, "no current frame pushed yet"),
+            TrackError::RectOutOfBounds { rect, frame } => write!(
+                f,
+                "detection rect {:?} empty or outside frame {:?}",
+                rect, frame
+            ),
         }
     }
 }

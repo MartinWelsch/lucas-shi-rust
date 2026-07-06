@@ -41,10 +41,28 @@ impl FeaturesBuffer {
         }
     }
 
+    /// Resize the per-pixel scratch planes when the detection view's
+    /// dimensions change (e.g. AOI-bounded detection with a moving rect).
+    /// Calls with stable dimensions allocate nothing.
+    fn ensure_dims(&mut self, width: u32, height: u32) {
+        if self.gx.dimensions() == (width, height) {
+            return;
+        }
+        self.gx = ImageBuffer::new(width, height);
+        self.gy = ImageBuffer::new(width, height);
+        self.ix_sq = ImageBuffer::new(width, height);
+        self.iy_sq = ImageBuffer::new(width, height);
+        self.ix_iy = ImageBuffer::new(width, height);
+    }
+
     /// Detect Shi-Tomasi features on `image`, writing up to `max_features`
     /// `Feature` entries into `out` (cleared first), in descending quality
     /// order. No heap allocation when the buffer was sized for the same
     /// resolution and `min_distance`, and `out` has enough capacity.
+    ///
+    /// `image` may be any supported view, including a strided subrect of a
+    /// larger frame — quality thresholding, the min-distance grid, and the
+    /// `max_features` budget are all local to the view.
     pub(crate) fn detect_into(
         &mut self,
         image: &FlatSamples<&[u8]>,
@@ -55,6 +73,7 @@ impl FeaturesBuffer {
     ) {
         let width = image.layout.width;
         let height = image.layout.height;
+        self.ensure_dims(width, height);
 
         compute_gradients_into(image, &mut self.gx, &mut self.gy);
         compute_gradient_products_into(&self.gx, &self.gy, &mut self.ix_sq, &mut self.iy_sq, &mut self.ix_iy);
