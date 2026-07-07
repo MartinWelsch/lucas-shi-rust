@@ -42,17 +42,32 @@ impl FeaturesBuffer {
     }
 
     /// Resize the per-pixel scratch planes when the detection view's
-    /// dimensions change (e.g. AOI-bounded detection with a moving rect).
-    /// Calls with stable dimensions allocate nothing.
+    /// dimensions change (e.g. AOI-bounded detection with a moving rect, or
+    /// switching between full-frame and rect-bounded detection). Calls with
+    /// stable dimensions allocate nothing.
+    ///
+    /// Grow-only: each plane's *backing storage* keeps the high-water-mark
+    /// pixel count it has ever been sized to (the same pattern already used
+    /// for `is_local_max` / `grid` below, which reuse capacity via
+    /// `Vec::resize`). A dims change only forces a fresh heap allocation the
+    /// first time it needs more pixels than any previous call — e.g. once
+    /// `detect_features` (full-frame) has run, every subsequent
+    /// `detect_features_in_rect` call (rect ⊆ frame) reuses that same
+    /// allocation for the rest of the tracker's lifetime, however many
+    /// different rect sizes the AOI takes on. The resulting buffer's
+    /// declared dimensions still match the request exactly, so every
+    /// downstream kernel (which iterates the plane's full
+    /// `width × height`) sees precisely the same view it always did —
+    /// bit-identical to always allocating fresh.
     fn ensure_dims(&mut self, width: u32, height: u32) {
         if self.gx.dimensions() == (width, height) {
             return;
         }
-        self.gx = ImageBuffer::new(width, height);
-        self.gy = ImageBuffer::new(width, height);
-        self.ix_sq = ImageBuffer::new(width, height);
-        self.iy_sq = ImageBuffer::new(width, height);
-        self.ix_iy = ImageBuffer::new(width, height);
+        resize_scratch_plane(&mut self.gx, width, height);
+        resize_scratch_plane(&mut self.gy, width, height);
+        resize_scratch_plane(&mut self.ix_sq, width, height);
+        resize_scratch_plane(&mut self.iy_sq, width, height);
+        resize_scratch_plane(&mut self.ix_iy, width, height);
     }
 
     /// Detect Shi-Tomasi features on `image`, writing up to `max_features`
@@ -128,6 +143,22 @@ pub fn good_features_to_track(
     let mut out: Vec<Feature> = Vec::with_capacity(max);
     buf.detect_into(&image.as_flat_samples(), quality_level, min_distance, max, &mut out);
     out.into_iter().map(|f| (f.x as u32, f.y as u32, f.strength)).collect()
+}
+
+/// Resize `buf` to `(width, height)`, reusing its existing backing `Vec`
+/// when it already has enough capacity instead of always allocating a fresh
+/// one (what plain `ImageBuffer::new` does on every call, even when
+/// shrinking). `Vec::resize` only reallocates when growing past current
+/// capacity, so repeated calls at-or-below any previously-seen pixel count
+/// are heap-allocation-free. Declared dimensions always end up exactly
+/// `(width, height)` — identical to a fresh `ImageBuffer::new(width,
+/// height)` from the caller's point of view.
+fn resize_scratch_plane(buf: &mut ImageBuffer<Luma<i16>, Vec<i16>>, width: u32, height: u32) {
+    let needed = (width as usize) * (height as usize);
+    let mut raw = std::mem::replace(buf, ImageBuffer::new(0, 0)).into_raw();
+    raw.resize(needed, 0);
+    *buf = ImageBuffer::from_raw(width, height, raw)
+        .expect("resized buffer length matches width * height");
 }
 
 fn compute_gradient_products_into(
@@ -295,6 +326,79 @@ fn filter_by_distance_into(
             let cell_idx = (cell_y * grid_width + cell_x) as usize;
             grid[cell_idx] = Some((x, y));
             out.push(Feature { x: x as f32, y: y as f32, strength: q });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn textured(width: u32, height: u32, phase: u32) -> GrayImage {
+        let mut img = GrayImage::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let v = ((x * 47 + y * 31 + phase * 19 + (x ^ y) * 5 + (x * y) % 13) & 0xff) as u8;
+                img.put_pixel(x, y, Luma([v]));
+            }
+        }
+        img
+    }
+
+    fn detect(img: &GrayImage, quality: f32, min_distance: u32, max_features: usize) -> Vec<Feature> {
+        let mut buf = FeaturesBuffer::with_capacity(img.width(), img.height(), min_distance, max_features);
+        let mut out = Vec::new();
+        buf.detect_into(&img.as_flat_samples(), quality, min_distance, max_features, &mut out);
+        out
+    }
+
+    /// A4 pin: the grow-only `ensure_dims` (backing-storage reuse across
+    /// dimension changes) must not change detection results. Run the same
+    /// buffer through several dimension changes — growing past its initial
+    /// capacity, then shrinking below it, then back to the very first
+    /// image — and check that final run against a brand new
+    /// `FeaturesBuffer` that only ever sees that one image (so its planes
+    /// are freshly allocated at exactly that size, never resized).
+    #[test]
+    fn detect_after_dims_churn_matches_fresh_buffer() {
+        const QUALITY: f32 = 0.1;
+        const MIN_DIST: u32 = 4;
+        const MAX_FEATURES: usize = 64;
+
+        let rect_image = textured(40, 40, 0);
+        let bigger_image = textured(96, 80, 1);
+        let smaller_image = textured(20, 30, 2);
+
+        let mut buf = FeaturesBuffer::with_capacity(40, 40, MIN_DIST, MAX_FEATURES);
+        let mut out = Vec::new();
+
+        // Baseline run at the buffer's initial dims.
+        buf.detect_into(&rect_image.as_flat_samples(), QUALITY, MIN_DIST, MAX_FEATURES, &mut out);
+        let baseline = out.clone();
+        assert!(!baseline.is_empty(), "textured image should yield corners");
+
+        // Grow past initial capacity, then shrink below it, then bounce
+        // between a couple of other sizes to churn the backing storage.
+        buf.detect_into(&bigger_image.as_flat_samples(), QUALITY, MIN_DIST, MAX_FEATURES, &mut out);
+        buf.detect_into(&smaller_image.as_flat_samples(), QUALITY, MIN_DIST, MAX_FEATURES, &mut out);
+        buf.detect_into(&bigger_image.as_flat_samples(), QUALITY, MIN_DIST, MAX_FEATURES, &mut out);
+        buf.detect_into(&smaller_image.as_flat_samples(), QUALITY, MIN_DIST, MAX_FEATURES, &mut out);
+
+        // Detect on the original rect/content again, after all that churn.
+        buf.detect_into(&rect_image.as_flat_samples(), QUALITY, MIN_DIST, MAX_FEATURES, &mut out);
+
+        // Compare against a fresh buffer that only ever sees this image.
+        let fresh = detect(&rect_image, QUALITY, MIN_DIST, MAX_FEATURES);
+
+        assert_eq!(out.len(), baseline.len());
+        assert_eq!(out.len(), fresh.len());
+        for ((churned, base), fresh) in out.iter().zip(baseline.iter()).zip(fresh.iter()) {
+            assert_eq!(churned.x, base.x);
+            assert_eq!(churned.y, base.y);
+            assert_eq!(churned.strength, base.strength);
+            assert_eq!(churned.x, fresh.x);
+            assert_eq!(churned.y, fresh.y);
+            assert_eq!(churned.strength, fresh.strength);
         }
     }
 }

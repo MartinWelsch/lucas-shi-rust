@@ -183,3 +183,53 @@ fn tracker_detect_features_is_zero_alloc_after_warmup() {
          after warm-up; expected 0."
     );
 }
+
+// A4: FeaturesBuffer's per-pixel scratch planes (gx/gy/ix_sq/iy_sq/ix_iy)
+// must reuse their backing storage across the AOI rect's changing dims
+// instead of reallocating whenever the rect resizes — once a call at some
+// pixel count has run (here, the full-frame `detect_features` warm-up),
+// every rect whose pixel count doesn't exceed it should be allocation-free.
+#[test]
+fn tracker_detect_features_in_rect_churning_dims_is_zero_alloc_after_warmup() {
+    const W: u32 = 256;
+    const H: u32 = 256;
+    let frame = checkerboard(W, H, 8);
+    let view = make_view(&frame, W, H);
+
+    let mut tracker = OpticalFlowBuilder::new(W, H).build();
+    tracker.push_frame(&view).unwrap();
+    // Warm-up: a full-frame detect sizes the scratch planes to their
+    // largest possible extent up front.
+    tracker.detect_features().unwrap();
+
+    // A handful of differently sized/positioned rects, deliberately
+    // bouncing dimensions up and down the way a tracked face AOI would.
+    let rects: [(u32, u32, u32, u32); 6] = [
+        (10, 10, 130, 130),
+        (20, 20, 64, 90),
+        (0, 0, 200, 40),
+        (5, 5, 40, 200),
+        (30, 30, 130, 130),
+        (0, 0, 8, 8),
+    ];
+    // Warm-up pass over every rect once, in case any rect-specific scratch
+    // (e.g. the min-distance grid) still needs to grow for that shape.
+    for &(x, y, w, h) in &rects {
+        tracker.detect_features_in_rect(x, y, w, h).unwrap();
+    }
+
+    let n_alloc = measure(|| {
+        for _ in 0..3 {
+            for &(x, y, w, h) in &rects {
+                tracker.detect_features_in_rect(x, y, w, h).unwrap();
+            }
+        }
+    });
+
+    assert_eq!(
+        n_alloc, 0,
+        "detect_features_in_rect allocated {n_alloc} times across {} calls over \
+         churning rect dims after warm-up; expected 0.",
+        3 * rects.len()
+    );
+}
