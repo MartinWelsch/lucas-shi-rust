@@ -264,6 +264,19 @@ fn in_bounds(img: &GrayImage, x: f32, y: f32, radius: usize) -> bool {
 }
 
 /// Bilinear interpolation of the pixel value.
+///
+/// Weights are computed once from `(dx, dy)`. When the 2×2 sample cell is
+/// fully in bounds, a single range check lets us read all four taps via raw
+/// slice indexing (no per-tap `get_pixel_checked` + branchy weight select).
+/// Otherwise we fall back to the original per-tap bounds-checked path,
+/// preserving the existing out-of-bounds→0.0 convention (including the
+/// wrinkle where an in-bounds *window* can still sample a tap exactly at
+/// `x == width` / `y == height`, contributing 0.0 with nonzero weight).
+///
+/// BIT-EXACT: both paths accumulate `p * wx * wy` in the same left-to-right
+/// order and in the same (x0,y0),(x0,y1),(x1,y0),(x1,y1) tap order as the
+/// original implementation, so results are bit-identical to it (see the
+/// `interpolate_matches_reference_*` tests below).
 fn interpolate<P>(img: &ImageBuffer<Luma<P>, Vec<P>>, x: f32, y: f32) -> f32
 where
     P: Primitive + Into<f32>,
@@ -275,26 +288,51 @@ where
 
     let dx = x - x0 as f32;
     let dy = y - y0 as f32;
+    let dx1 = 1.0 - dx;
+    let dy1 = 1.0 - dy;
 
-    let mut sum = 0.0f32;
-    for (sx, sy) in &[(x0, y0), (x0, y1), (x1, y0), (x1, y1)] {
-        let px = img
-            .get_pixel_checked(*sx as u32, *sy as u32)
-            .map(|p| p[0].into())
-            .unwrap_or(0.0);
+    let width = img.width() as i32;
+    let height = img.height() as i32;
 
-        let wx = if sx == &x0 { 1.0 - dx } else { dx };
-        let wy = if sy == &y0 { 1.0 - dy } else { dy };
+    if x0 >= 0 && y0 >= 0 && x1 < width && y1 < height {
+        // Fast path: the whole 2x2 cell is in bounds — single check, then
+        // raw contiguous reads (image buffers are always width-stride here).
+        let stride = width as usize;
+        let raw = img.as_raw();
+        let base = y0 as usize * stride + x0 as usize;
+        let p00: f32 = raw[base].into();
+        let p01: f32 = raw[base + stride].into();
+        let p10: f32 = raw[base + 1].into();
+        let p11: f32 = raw[base + stride + 1].into();
 
-        sum += px * wx * wy;
+        let mut sum = 0.0f32;
+        sum += p00 * dx1 * dy1;
+        sum += p01 * dx1 * dy;
+        sum += p10 * dx * dy1;
+        sum += p11 * dx * dy;
+        sum
+    } else {
+        // Slow path: original per-tap bounds-checked behavior.
+        let mut sum = 0.0f32;
+        for (sx, sy) in &[(x0, y0), (x0, y1), (x1, y0), (x1, y1)] {
+            let px = img
+                .get_pixel_checked(*sx as u32, *sy as u32)
+                .map(|p| p[0].into())
+                .unwrap_or(0.0);
+
+            let wx = if sx == &x0 { dx1 } else { dx };
+            let wy = if sy == &y0 { dy1 } else { dy };
+
+            sum += px * wx * wy;
+        }
+        sum
     }
-
-    sum
 }
 
 #[cfg(test)]
 mod tests {
-    use super::invert_2x2;
+    use super::{interpolate, invert_2x2};
+    use image::{GrayImage, Luma};
 
     #[test]
     fn invert_2x2_returns_inverse_components() {
@@ -308,5 +346,109 @@ mod tests {
     #[test]
     fn invert_2x2_rejects_singular_matrix() {
         assert!(invert_2x2(1.0, 2.0, 4.0, 1e-6).is_none());
+    }
+
+    /// Reference copy of the pre-A1 `interpolate` implementation (per-tap
+    /// `get_pixel_checked` + branchy weight select). Kept only in test code
+    /// so we can pin the optimized version against it.
+    fn interpolate_reference<P>(img: &image::ImageBuffer<Luma<P>, Vec<P>>, x: f32, y: f32) -> f32
+    where
+        P: image::Primitive + Into<f32>,
+    {
+        let x0 = x.floor() as i32;
+        let y0 = y.floor() as i32;
+        let x1 = x0 + 1;
+        let y1 = y0 + 1;
+
+        let dx = x - x0 as f32;
+        let dy = y - y0 as f32;
+
+        let mut sum = 0.0f32;
+        for (sx, sy) in &[(x0, y0), (x0, y1), (x1, y0), (x1, y1)] {
+            let px = img
+                .get_pixel_checked(*sx as u32, *sy as u32)
+                .map(|p| p[0].into())
+                .unwrap_or(0.0);
+
+            let wx = if sx == &x0 { 1.0 - dx } else { dx };
+            let wy = if sy == &y0 { 1.0 - dy } else { dy };
+
+            sum += px * wx * wy;
+        }
+
+        sum
+    }
+
+    fn textured_image(width: u32, height: u32) -> GrayImage {
+        let mut img = GrayImage::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                // Non-trivial, non-symmetric texture so every tap combination
+                // sees a distinct value.
+                let v = ((x * 37 + y * 23 + (x ^ y) * 11 + (x * y) % 13) & 0xff) as u8;
+                img.put_pixel(x, y, Luma([v]));
+            }
+        }
+        img
+    }
+
+    /// Dense grid of fractional positions, including cells whose 2x2 window
+    /// touches every border (top-left corner through bottom-right corner,
+    /// and one step further out so the out-of-bounds slow path is exercised
+    /// too), asserting EXACT f32 equality against the reference.
+    #[test]
+    fn interpolate_matches_reference_dense_grid() {
+        let img = textured_image(24, 20);
+        let (w, h) = (img.width() as i32, img.height() as i32);
+
+        // Cover x0/y0 from -2 (fully out of bounds) through width/height
+        // (tap at the far edge, in-bounds window but zero-weighted OOB tap),
+        // at a dense set of fractional offsets.
+        let fracs: [f32; 7] = [0.0, 0.05, 0.25, 0.5, 0.5, 0.75, 0.999];
+        for base_x in -2..=w {
+            for base_y in -2..=h {
+                for &fx in &fracs {
+                    for &fy in &fracs {
+                        let x = base_x as f32 + fx;
+                        let y = base_y as f32 + fy;
+                        let expected = interpolate_reference(&img, x, y);
+                        let actual = interpolate(&img, x, y);
+                        assert_eq!(
+                            actual.to_bits(),
+                            expected.to_bits(),
+                            "mismatch at x={x}, y={y}: actual={actual}, expected={expected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Explicitly pin the four "cell touches this border" corners called out
+    /// in the spec: top-left, top-right, bottom-left, bottom-right.
+    #[test]
+    fn interpolate_matches_reference_at_every_border() {
+        let img = textured_image(10, 8);
+        let (w, h) = (img.width() as f32, img.height() as f32);
+        let positions = [
+            (0.0, 0.0),           // top-left corner, cell fully in bounds
+            (-0.5, -0.5),         // top-left, cell out of bounds
+            (w - 1.0, 0.0),       // top-right, in bounds (tap at x == w-1)
+            (w - 0.5, 0.0),       // top-right, tap lands at x == w (OOB tap, in-bounds window edge case)
+            (0.0, h - 1.0),       // bottom-left, in bounds
+            (0.0, h - 0.5),       // bottom-left, tap at y == h
+            (w - 1.0, h - 1.0),   // bottom-right, in bounds
+            (w - 0.5, h - 0.5),   // bottom-right, taps at x == w and y == h
+            (w, h),               // fully out of bounds
+        ];
+        for (x, y) in positions {
+            let expected = interpolate_reference(&img, x, y);
+            let actual = interpolate(&img, x, y);
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "mismatch at x={x}, y={y}: actual={actual}, expected={expected}"
+            );
+        }
     }
 }
