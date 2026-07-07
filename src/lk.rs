@@ -1,6 +1,7 @@
 use image::{GrayImage, ImageBuffer, Luma, Primitive};
 
 use crate::feature::Feature;
+use crate::pyramid::PyramidBuffer;
 use crate::utils::fast_gradients::compute_gradients_into;
 
 /// Reusable storage for the Lucas-Kanade tracking pipeline. Pre-allocates
@@ -50,6 +51,13 @@ impl LkBuffer {
     /// updating each `Feature`'s `(x, y)` by the computed displacement.
     /// `strength` is left untouched. No heap allocation when the buffer was
     /// sized for the same parameters.
+    ///
+    /// Recomputes gradients for `prev_pyramid` on every call — kept only for
+    /// the deprecated [`calc_optical_flow`] entry point, which is handed raw
+    /// pyramid slices with no cached gradient planes. Steady-state tracking
+    /// (`OpticalFlowTracker` and [`buffers::track`](crate::buffers::track))
+    /// uses [`calc_into_cached`](Self::calc_into_cached) instead, which reads
+    /// gradients [`PyramidBuffer`] already computed once at build time.
     pub(crate) fn calc_into(
         &mut self,
         prev_pyramid: &[GrayImage],
@@ -72,7 +80,9 @@ impl LkBuffer {
     ///
     /// `valid_out`, when `Some`, is cleared and resized to `features.len()`.
     /// Passing `None` skips status bookkeeping entirely (the plain
-    /// `calc_into` path).
+    /// `calc_into` path). Recomputes `prev_pyramid`'s gradients every call —
+    /// see [`calc_into`](Self::calc_into) for why this legacy path still
+    /// exists alongside [`calc_into_status_cached`](Self::calc_into_status_cached).
     pub(crate) fn calc_into_status(
         &mut self,
         prev_pyramid: &[GrayImage],
@@ -85,22 +95,9 @@ impl LkBuffer {
 
         let n_levels = prev_pyramid.len();
         let radius = self.window_size / 2;
-        let epsilon = 1e-3;
-        let det_epsilon = 1e-6;
-
-        self.displacements.clear();
-        self.displacements.resize(features.len(), (0.0, 0.0));
-
-        if let Some(valid) = valid_out.as_deref_mut() {
-            valid.clear();
-            // A feature is valid only if it produced a flow estimate at the
-            // coarsest level. Start all-false; the coarsest-level pass flips
-            // surviving features to true.
-            valid.resize(features.len(), false);
-        }
-        // The coarsest level drives the validity decision: a feature skipped
-        // there never enters tracking at all and stays at (0, 0).
         let coarsest = n_levels - 1;
+
+        Self::reset_status(&mut self.displacements, valid_out.as_deref_mut(), features.len());
 
         for level in (0..n_levels).rev() {
             let scale = 2f32.powi(level as i32);
@@ -113,86 +110,217 @@ impl LkBuffer {
                 &mut self.grad_y[level],
             );
 
-            for (fi, (feat, disp)) in features
-                .iter()
-                .zip(self.displacements.iter_mut())
-                .enumerate()
-            {
-                let x = feat.x / scale;
-                let y = feat.y / scale;
-                let mut dx = disp.0 / scale;
-                let mut dy = disp.1 / scale;
-
-                if !in_bounds(prev_img, x, y, radius) {
-                    continue;
-                }
-
-                let mut gxx = 0.0f32;
-                let mut gxy = 0.0f32;
-                let mut gyy = 0.0f32;
-
-                for (idx, (ox, oy)) in self.offsets.iter().enumerate() {
-                    let sample_x = x + ox;
-                    let sample_y = y + oy;
-                    let ix = interpolate(&self.grad_x[level], sample_x, sample_y) / 32.0;
-                    let iy = interpolate(&self.grad_y[level], sample_x, sample_y) / 32.0;
-
-                    self.prev_patch[idx] = interpolate(prev_img, sample_x, sample_y);
-                    self.ix_patch[idx] = ix;
-                    self.iy_patch[idx] = iy;
-                    gxx += ix * ix;
-                    gxy += ix * iy;
-                    gyy += iy * iy;
-                }
-
-                let Some((inv_h00, inv_h01, inv_h11)) = invert_2x2(gxx, gxy, gyy, det_epsilon) else {
-                    continue;
-                };
-
-                // Reached tracking at the coarsest level ⇒ this feature has a
-                // genuine flow estimate (not a stuck (0, 0)).
-                if level == coarsest
-                    && let Some(valid) = valid_out.as_deref_mut()
-                {
-                    valid[fi] = true;
-                }
-
-                for _ in 0..max_iterations {
-                    let curr_x = x + dx;
-                    let curr_y = y + dy;
-
-                    if !in_bounds(curr_img, curr_x, curr_y, radius) {
-                        break;
-                    }
-
-                    let mut bx = 0.0f32;
-                    let mut by = 0.0f32;
-
-                    for (idx, (ox, oy)) in self.offsets.iter().enumerate() {
-                        let curr = interpolate(curr_img, curr_x + ox, curr_y + oy);
-                        let error = self.prev_patch[idx] - curr;
-                        bx += self.ix_patch[idx] * error;
-                        by += self.iy_patch[idx] * error;
-                    }
-
-                    let ddx = inv_h00 * bx + inv_h01 * by;
-                    let ddy = inv_h01 * bx + inv_h11 * by;
-                    dx += ddx;
-                    dy += ddy;
-
-                    if ddx.abs() < epsilon && ddy.abs() < epsilon {
-                        break;
-                    }
-                }
-
-                *disp = (dx * scale, dy * scale);
-            }
+            track_level(
+                prev_img,
+                curr_img,
+                &self.grad_x[level],
+                &self.grad_y[level],
+                scale,
+                radius,
+                max_iterations,
+                level == coarsest,
+                features,
+                &mut self.displacements,
+                &self.offsets,
+                &mut self.prev_patch,
+                &mut self.ix_patch,
+                &mut self.iy_patch,
+                valid_out.as_deref_mut().map(|v| v.as_mut_slice()),
+            );
         }
 
-        for (feat, disp) in features.iter_mut().zip(self.displacements.iter()) {
+        Self::apply_displacements(features, &self.displacements);
+    }
+
+    /// Like [`calc_into`](Self::calc_into) but sources `prev_pyramid`'s
+    /// gradients from its cache instead of recomputing them. Used by the
+    /// steady-state tracking path (`OpticalFlowTracker` and
+    /// [`buffers::track`](crate::buffers::track)), where each physical
+    /// pyramid buffer's gradients are computed exactly once, in
+    /// [`PyramidBuffer::build_into`], regardless of how many LK calls treat
+    /// it as the "prev" role afterward.
+    pub(crate) fn calc_into_cached(
+        &mut self,
+        prev_pyramid: &PyramidBuffer,
+        curr_pyramid: &PyramidBuffer,
+        features: &mut [Feature],
+        max_iterations: usize,
+    ) {
+        self.calc_into_status_cached(prev_pyramid, curr_pyramid, features, max_iterations, None);
+    }
+
+    /// Cached-gradient counterpart of [`calc_into_status`](Self::calc_into_status);
+    /// see that method for the validity-reporting contract and
+    /// [`calc_into_cached`](Self::calc_into_cached) for why this variant
+    /// exists.
+    pub(crate) fn calc_into_status_cached(
+        &mut self,
+        prev_pyramid: &PyramidBuffer,
+        curr_pyramid: &PyramidBuffer,
+        features: &mut [Feature],
+        max_iterations: usize,
+        mut valid_out: Option<&mut Vec<bool>>,
+    ) {
+        let prev_levels = prev_pyramid.levels();
+        let curr_levels = curr_pyramid.levels();
+        assert_eq!(prev_levels.len(), curr_levels.len());
+
+        let n_levels = prev_levels.len();
+        let radius = self.window_size / 2;
+        let coarsest = n_levels - 1;
+
+        Self::reset_status(&mut self.displacements, valid_out.as_deref_mut(), features.len());
+
+        for level in (0..n_levels).rev() {
+            let scale = 2f32.powi(level as i32);
+            let prev_img = &prev_levels[level];
+            let curr_img = &curr_levels[level];
+            let (grad_x, grad_y) = prev_pyramid.grad_planes(level);
+
+            track_level(
+                prev_img,
+                curr_img,
+                grad_x,
+                grad_y,
+                scale,
+                radius,
+                max_iterations,
+                level == coarsest,
+                features,
+                &mut self.displacements,
+                &self.offsets,
+                &mut self.prev_patch,
+                &mut self.ix_patch,
+                &mut self.iy_patch,
+                valid_out.as_deref_mut().map(|v| v.as_mut_slice()),
+            );
+        }
+
+        Self::apply_displacements(features, &self.displacements);
+    }
+
+    /// Shared setup for both `calc_into_status*` entry points: clear/resize
+    /// the displacement and validity scratch to `n_features`.
+    fn reset_status(displacements: &mut Vec<(f32, f32)>, valid_out: Option<&mut Vec<bool>>, n_features: usize) {
+        displacements.clear();
+        displacements.resize(n_features, (0.0, 0.0));
+
+        if let Some(valid) = valid_out {
+            valid.clear();
+            // A feature is valid only if it produced a flow estimate at the
+            // coarsest level. Start all-false; the coarsest-level pass flips
+            // surviving features to true.
+            valid.resize(n_features, false);
+        }
+    }
+
+    /// Shared teardown for both `calc_into_status*` entry points: apply the
+    /// accumulated per-level displacement to each feature's position.
+    fn apply_displacements(features: &mut [Feature], displacements: &[(f32, f32)]) {
+        for (feat, disp) in features.iter_mut().zip(displacements.iter()) {
             feat.x += disp.0;
             feat.y += disp.1;
         }
+    }
+}
+
+/// Track every feature through one pyramid level: build the per-feature
+/// Hessian from the (cached or freshly computed) gradient planes, then run
+/// the iterative Lucas-Kanade refinement against `curr_img`. Shared by
+/// [`LkBuffer::calc_into_status`] (recomputed gradients) and
+/// [`LkBuffer::calc_into_status_cached`] (`PyramidBuffer`-cached gradients)
+/// so the hot inner loop — including [`interpolate`] — has a single
+/// implementation.
+#[allow(clippy::too_many_arguments)]
+fn track_level(
+    prev_img: &GrayImage,
+    curr_img: &GrayImage,
+    grad_x: &ImageBuffer<Luma<i16>, Vec<i16>>,
+    grad_y: &ImageBuffer<Luma<i16>, Vec<i16>>,
+    scale: f32,
+    radius: usize,
+    max_iterations: usize,
+    is_coarsest: bool,
+    features: &[Feature],
+    displacements: &mut [(f32, f32)],
+    offsets: &[(f32, f32)],
+    prev_patch: &mut [f32],
+    ix_patch: &mut [f32],
+    iy_patch: &mut [f32],
+    mut valid_out: Option<&mut [bool]>,
+) {
+    let epsilon = 1e-3;
+    let det_epsilon = 1e-6;
+
+    for (fi, (feat, disp)) in features.iter().zip(displacements.iter_mut()).enumerate() {
+        let x = feat.x / scale;
+        let y = feat.y / scale;
+        let mut dx = disp.0 / scale;
+        let mut dy = disp.1 / scale;
+
+        if !in_bounds(prev_img, x, y, radius) {
+            continue;
+        }
+
+        let mut gxx = 0.0f32;
+        let mut gxy = 0.0f32;
+        let mut gyy = 0.0f32;
+
+        for (idx, (ox, oy)) in offsets.iter().enumerate() {
+            let sample_x = x + ox;
+            let sample_y = y + oy;
+            let ix = interpolate(grad_x, sample_x, sample_y) / 32.0;
+            let iy = interpolate(grad_y, sample_x, sample_y) / 32.0;
+
+            prev_patch[idx] = interpolate(prev_img, sample_x, sample_y);
+            ix_patch[idx] = ix;
+            iy_patch[idx] = iy;
+            gxx += ix * ix;
+            gxy += ix * iy;
+            gyy += iy * iy;
+        }
+
+        let Some((inv_h00, inv_h01, inv_h11)) = invert_2x2(gxx, gxy, gyy, det_epsilon) else {
+            continue;
+        };
+
+        // Reached tracking at the coarsest level ⇒ this feature has a
+        // genuine flow estimate (not a stuck (0, 0)).
+        if is_coarsest
+            && let Some(valid) = valid_out.as_deref_mut()
+        {
+            valid[fi] = true;
+        }
+
+        for _ in 0..max_iterations {
+            let curr_x = x + dx;
+            let curr_y = y + dy;
+
+            if !in_bounds(curr_img, curr_x, curr_y, radius) {
+                break;
+            }
+
+            let mut bx = 0.0f32;
+            let mut by = 0.0f32;
+
+            for (idx, (ox, oy)) in offsets.iter().enumerate() {
+                let curr = interpolate(curr_img, curr_x + ox, curr_y + oy);
+                let error = prev_patch[idx] - curr;
+                bx += ix_patch[idx] * error;
+                by += iy_patch[idx] * error;
+            }
+
+            let ddx = inv_h00 * bx + inv_h01 * by;
+            let ddy = inv_h01 * bx + inv_h11 * by;
+            dx += ddx;
+            dy += ddy;
+
+            if ddx.abs() < epsilon && ddy.abs() < epsilon {
+                break;
+            }
+        }
+
+        *disp = (dx * scale, dy * scale);
     }
 }
 
@@ -331,7 +459,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{interpolate, invert_2x2};
+    use super::{interpolate, invert_2x2, LkBuffer};
     use image::{GrayImage, Luma};
 
     #[test]
@@ -449,6 +577,106 @@ mod tests {
                 expected.to_bits(),
                 "mismatch at x={x}, y={y}: actual={actual}, expected={expected}"
             );
+        }
+    }
+
+    /// A2 bit-exactness pin: `calc_into_status_cached` (reads Scharr
+    /// gradients cached by `PyramidBuffer::build_into`) must produce
+    /// identical results to `calc_into_status` (recomputes gradients from
+    /// the raw level slices every call) — same gradient function, same
+    /// pixel inputs, so the two paths must agree to the bit, in both the
+    /// forward (`prev -> curr`) and backward (`curr -> prev`) roles used by
+    /// `calculate_flow_fb`.
+    #[test]
+    fn calc_into_status_cached_matches_uncached_reference() {
+        use crate::feature::Feature;
+        use crate::pyramid::PyramidBuffer;
+
+        const W: u32 = 64;
+        const H: u32 = 64;
+        const LEVELS: usize = 3;
+        const WINDOW: usize = 11;
+        const MAX_ITERS: usize = 14;
+
+        fn textured(width: u32, height: u32, phase: u32) -> GrayImage {
+            let mut img = GrayImage::new(width, height);
+            for y in 0..height {
+                for x in 0..width {
+                    let v = ((x * 41 + y * 17 + phase * 13 + (x ^ y) * 7 + (x * y) % 11) & 0xff) as u8;
+                    img.put_pixel(x, y, Luma([v]));
+                }
+            }
+            img
+        }
+
+        let prev_img = textured(W, H, 0);
+        let curr_img = textured(W, H, 5);
+
+        let mut prev_pb = PyramidBuffer::with_capacity(W, H, LEVELS);
+        let mut curr_pb = PyramidBuffer::with_capacity(W, H, LEVELS);
+        prev_pb.build_into(&prev_img.as_flat_samples());
+        curr_pb.build_into(&curr_img.as_flat_samples());
+
+        let starting_features: Vec<Feature> = (0..W).step_by(6).flat_map(|x| {
+            (0..H).step_by(6).map(move |y| Feature { x: x as f32, y: y as f32, strength: 1.0 })
+        }).collect();
+
+        let mut buf = LkBuffer::with_capacity(W, H, LEVELS, WINDOW, starting_features.len());
+
+        // Forward role: prev -> curr.
+        let mut fwd_ref = starting_features.clone();
+        let mut fwd_ref_valid = Vec::new();
+        buf.calc_into_status(
+            prev_pb.levels(),
+            curr_pb.levels(),
+            &mut fwd_ref,
+            MAX_ITERS,
+            Some(&mut fwd_ref_valid),
+        );
+
+        let mut fwd_cached = starting_features.clone();
+        let mut fwd_cached_valid = Vec::new();
+        buf.calc_into_status_cached(
+            &prev_pb,
+            &curr_pb,
+            &mut fwd_cached,
+            MAX_ITERS,
+            Some(&mut fwd_cached_valid),
+        );
+
+        assert_eq!(fwd_ref_valid, fwd_cached_valid);
+        for (r, c) in fwd_ref.iter().zip(fwd_cached.iter()) {
+            assert_eq!(r.x.to_bits(), c.x.to_bits());
+            assert_eq!(r.y.to_bits(), c.y.to_bits());
+        }
+
+        // Backward role: curr -> prev (the role `calculate_flow_fb`'s
+        // second pass uses; exercises reading cached gradients off whatever
+        // physical pyramid is passed as `prev_pyramid`, here `curr_pb`).
+        let mut back_ref = starting_features.clone();
+        let mut back_ref_valid = Vec::new();
+        buf.calc_into_status(
+            curr_pb.levels(),
+            prev_pb.levels(),
+            &mut back_ref,
+            MAX_ITERS,
+            Some(&mut back_ref_valid),
+        );
+
+        let mut back_cached = starting_features.clone();
+        let mut back_cached_valid = Vec::new();
+        buf.calc_into_status_cached(
+            &curr_pb,
+            &prev_pb,
+            &mut back_cached,
+            MAX_ITERS,
+            Some(&mut back_cached_valid),
+        );
+
+        assert_eq!(back_ref_valid, back_cached_valid);
+        for (r, c) in back_ref.iter().zip(back_cached.iter()) {
+            assert_eq!(r.x.to_bits(), c.x.to_bits());
+            assert_eq!(r.y.to_bits(), c.y.to_bits());
         }
     }
 }

@@ -308,9 +308,9 @@ impl OpticalFlowTracker {
             return Err(TrackError::NoPreviousFrame);
         }
 
-        self.lk_buffer.calc_into(
-            self.prev_pyramid.levels(),
-            self.curr_pyramid.levels(),
+        self.lk_buffer.calc_into_cached(
+            &self.prev_pyramid,
+            &self.curr_pyramid,
             &mut self.features,
             self.max_iterations,
         );
@@ -357,9 +357,9 @@ impl OpticalFlowTracker {
             .extend(self.features.iter().map(|f| (f.x, f.y)));
 
         // Forward pass: prev -> curr, capturing per-feature validity.
-        self.lk_buffer.calc_into_status(
-            self.prev_pyramid.levels(),
-            self.curr_pyramid.levels(),
+        self.lk_buffer.calc_into_status_cached(
+            &self.prev_pyramid,
+            &self.curr_pyramid,
             &mut self.features,
             self.max_iterations,
             Some(&mut self.fb_fwd_valid),
@@ -368,9 +368,9 @@ impl OpticalFlowTracker {
         // Backward pass: curr -> prev, starting from the forward result.
         self.fb_back.clear();
         self.fb_back.extend(self.features.iter().copied());
-        self.lk_buffer.calc_into_status(
-            self.curr_pyramid.levels(),
-            self.prev_pyramid.levels(),
+        self.lk_buffer.calc_into_status_cached(
+            &self.curr_pyramid,
+            &self.prev_pyramid,
             &mut self.fb_back,
             self.max_iterations,
             Some(&mut self.fb_back_valid),

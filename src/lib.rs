@@ -101,6 +101,10 @@ pub mod buffers {
     /// Track `features` from `prev` into `curr` using Lucas-Kanade,
     /// mutating each `Feature`'s `(x, y)` in place. `strength` is left
     /// untouched.
+    ///
+    /// Reads `prev`'s Scharr gradients from its cache (computed once by the
+    /// [`build_pyramid`] call that last populated it) instead of
+    /// recomputing them here.
     pub fn track(
         buf: &mut LkBuffer,
         prev: &PyramidBuffer,
@@ -108,6 +112,6 @@ pub mod buffers {
         features: &mut [Feature],
         max_iterations: usize,
     ) {
-        buf.calc_into(prev.levels(), curr.levels(), features, max_iterations);
+        buf.calc_into_cached(prev, curr, features, max_iterations);
     }
 }

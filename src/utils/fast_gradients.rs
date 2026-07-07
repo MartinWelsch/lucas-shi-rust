@@ -31,6 +31,26 @@ pub(crate) fn compute_gradients_into(
     compute_gradients_into_dispatch(image, grad_x, grad_y);
 }
 
+/// Like [`compute_gradients_into`] but skips the initial zero-fill.
+///
+/// Callers must guarantee the border pixels are already zero and stay that
+/// way: true for a freshly allocated `ImageBuffer` (its backing `Vec` is
+/// zero-initialized) that is only ever written to via this function, since
+/// the SIMD/manual dispatch paths only touch interior pixels (`1..width-1`,
+/// `1..height-1`), never the border. Used by `PyramidBuffer` (`crate::pyramid`)
+/// to compute each level's gradients once at build time instead of on every
+/// LK call.
+pub(crate) fn compute_gradients_into_no_zero(
+    image: &FlatSamples<&[u8]>,
+    grad_x: &mut ImageBuffer<Luma<i16>, Vec<i16>>,
+    grad_y: &mut ImageBuffer<Luma<i16>, Vec<i16>>,
+) {
+    debug_assert_eq!(grad_x.dimensions(), (image.layout.width, image.layout.height));
+    debug_assert_eq!(grad_y.dimensions(), (image.layout.width, image.layout.height));
+
+    compute_gradients_into_dispatch(image, grad_x, grad_y);
+}
+
 #[cfg(target_arch = "aarch64")]
 fn compute_gradients_into_dispatch(
     image: &FlatSamples<&[u8]>,
