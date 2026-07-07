@@ -153,6 +153,16 @@ pub fn good_features_to_track(
 /// are heap-allocation-free. Declared dimensions always end up exactly
 /// `(width, height)` — identical to a fresh `ImageBuffer::new(width,
 /// height)` from the caller's point of view.
+///
+/// INVARIANT: `Vec::resize` zero-fills only the *grown tail*; on a
+/// shrink-then-grow (or grow past a smaller previous size) the retained
+/// prefix keeps values from a prior detection. This is only bit-identical
+/// to a fresh buffer because every `detect_into` kernel FULLY OVERWRITES
+/// each pixel it later reads (gradients, products, box filter, eigenvalues
+/// all assign, never `+=` into an assumed-zero interior, and NMS/quality
+/// read only written pixels). A future kernel that reads an un-written
+/// pixel expecting zero would see stale data — pinned today by
+/// `detect_after_dims_churn_matches_fresh_buffer`.
 fn resize_scratch_plane(buf: &mut ImageBuffer<Luma<i16>, Vec<i16>>, width: u32, height: u32) {
     let needed = (width as usize) * (height as usize);
     let mut raw = std::mem::replace(buf, ImageBuffer::new(0, 0)).into_raw();

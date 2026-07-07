@@ -143,6 +143,16 @@ impl PyramidBuffer {
 
     /// Borrow this level's cached Scharr gradient planes, computed by the
     /// most recent [`build_into`](Self::build_into) call.
+    ///
+    /// INVARIANT (load-bearing for cached LK): the planes are all-zero on a
+    /// freshly constructed buffer and only become valid after `build_into`.
+    /// A caller that reads them for a buffer that has never been built (e.g.
+    /// using a just-allocated pyramid as the flow `prev`) gets zero
+    /// gradients → singular Hessian → every feature reported invalid, i.e. a
+    /// SILENT tracking dropout, not a panic. The steady-state pipeline avoids
+    /// this because flow only ever treats a pyramid as `prev` after it has
+    /// served as `curr` (and so been built) — enforced by the
+    /// `frame_count >= 2` gate in `calculate_flow`/`calculate_flow_fb`.
     pub(crate) fn grad_planes(
         &self,
         level: usize,
